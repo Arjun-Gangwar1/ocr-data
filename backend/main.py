@@ -1288,7 +1288,15 @@ def submit_page(page_name: str, current: dict = Depends(get_current_user)):
         assigns = [dict(r) for r in cur.fetchall()]
         submitted = [x for x in assigns if x["status"] == "submitted"]
 
-        if len(assigns) >= 2 and len(submitted) >= 2:
+        if a is not None and a.get("tier") == 3:
+            # Tier-3 adjudicator's submission is final
+            cur.execute(
+                "UPDATE pages SET area = 'approved', iaa_status = 'adjudicated', review_note = NULL "
+                "WHERE page_name = %s RETURNING *",
+                (page_name,),
+            )
+            updated = dict(cur.fetchone())
+        elif len(assigns) >= 2 and len(submitted) >= 2:
             # Double-blind pair complete → compute inter-annotator agreement
             t1 = scoring.transcript_from_boxes(box_db.get_boxes_for_assignment(page_name, submitted[0]["id"]))
             t2 = scoring.transcript_from_boxes(box_db.get_boxes_for_assignment(page_name, submitted[1]["id"]))

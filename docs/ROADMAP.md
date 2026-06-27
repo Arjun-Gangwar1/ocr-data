@@ -102,7 +102,7 @@ submits); `needs_adjudication` on disagreement; `GET /my-assignments`, `GET /pag
 **Follow-ups for #4 (frontend + adjudication):**
 - **Annotator UI must switch from `/my-pages` to `/my-assignments`** — `/my-pages` keys off `assigned_to` (tier-1 only), so a tier-2 annotator's work is invisible there.
 - **Canonical boxes for accepted pages:** an "agreed" page still has *two* box sets; pick tier-1 (or the adjudicated tier-3) as canonical for manager view / B2 export.
-- **Tier-3 adjudication:** auto-create a tier-3 assignment for `needs_adjudication` pages, build the side-by-side view, and on tier-3 submit set `area='approved'`.
+- **Tier-3 adjudication:** auto-create / assign a tier-3 assignment for `needs_adjudication` pages and build the side-by-side view. (Backend already finalises the page when a tier-3 assignment is submitted → `area='approved'`, `iaa_status='adjudicated'` — so only the assign + UI remain.)
 - **Concurrency:** the 2-assignments-per-page cap is enforced sequentially, not by a DB constraint — add a row lock / partial unique index if concurrent approvals become possible.
 - Optionally lock an annotator's boxes once their assignment is `submitted` (today only terminal page states block re-submit).
 
