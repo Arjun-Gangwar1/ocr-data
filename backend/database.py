@@ -126,6 +126,15 @@ def init_db():
             CONSTRAINT box_history_page_name_fk FOREIGN KEY (page_name)
                 REFERENCES pages(page_name) ON DELETE CASCADE ON UPDATE CASCADE
         );
+        CREATE TABLE IF NOT EXISTS gold_scores (
+            id        SERIAL PRIMARY KEY,
+            page_name TEXT NOT NULL,
+            annotator TEXT NOT NULL,
+            score     REAL NOT NULL,
+            at        TIMESTAMP DEFAULT NOW(),
+            CONSTRAINT gold_scores_page_name_fk FOREIGN KEY (page_name)
+                REFERENCES pages(page_name) ON DELETE CASCADE ON UPDATE CASCADE
+        );
     """)
 
     # Add new columns to existing installs
@@ -144,6 +153,8 @@ def init_db():
         "upload_approval_status TEXT NOT NULL DEFAULT 'pending'",
         "upload_approval_note   TEXT",
         "mask_status            TEXT NOT NULL DEFAULT 'pending'",
+        "is_gold                BOOLEAN NOT NULL DEFAULT FALSE",
+        "gold_transcript        TEXT",
     ]:
         cur.execute(f"ALTER TABLE pages ADD COLUMN IF NOT EXISTS {col_def}")
 
@@ -322,6 +333,7 @@ def init_db():
     cur.execute("CREATE INDEX IF NOT EXISTS idx_assignments_annotator ON assignments(annotator)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_boxes_assignment ON boxes(assignment_id)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_box_history_page ON box_history(page_name)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_gold_scores_annotator ON gold_scores(annotator)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_documents_folder_id ON documents(folder_id)")
 
     # Ensure FK with ON DELETE CASCADE + ON UPDATE CASCADE for boxes

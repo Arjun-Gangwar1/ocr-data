@@ -1253,7 +1253,7 @@ def submit_page(page_name: str, current: dict = Depends(get_current_user)):
     try:
         # Lock the page row so two annotators submitting at once serialise here
         # (otherwise neither observes the other's submission and IAA never fires).
-        cur.execute("SELECT assigned_to, area FROM pages WHERE page_name = %s FOR UPDATE", (page_name,))
+        cur.execute("SELECT assigned_to, area, is_gold, gold_transcript FROM pages WHERE page_name = %s FOR UPDATE", (page_name,))
         row = cur.fetchone()
         if not row:
             raise HTTPException(404, "Page not found")
@@ -1270,6 +1270,14 @@ def submit_page(page_name: str, current: dict = Depends(get_current_user)):
             cur.execute(
                 "UPDATE assignments SET status = 'submitted', submitted_at = NOW() WHERE id = %s",
                 (a["id"],),
+            )
+
+        # Hidden gold-page calibration scoring (silent to the annotator)
+        if a is not None and row.get("is_gold") and row.get("gold_transcript"):
+            ann_t = scoring.transcript_from_boxes(box_db.get_boxes_for_assignment(page_name, a["id"]))
+            cur.execute(
+                "INSERT INTO gold_scores (page_name, annotator, score) VALUES (%s, %s, %s)",
+                (page_name, current["username"], scoring.agreement(row["gold_transcript"], ann_t)),
             )
 
         cur.execute(
@@ -1355,6 +1363,54 @@ def adjudication_queue(_: dict = Depends(require_manager)):
         ORDER BY p.iaa ASC NULLS FIRST, d.uploaded_at ASC
     """)
     rows = [dict(r) for r in cur.fetchall()]
+    cur.close(); conn.close()
+    return rows
+
+
+# ── Gold pages + calibration (A2) ─────────────────────────────────────────────
+
+@app.post("/admin/pages/{page_name}/gold")
+def set_gold(page_name: str, body: schemas.GoldDesignate, _: dict = Depends(require_admin)):
+    """Mark a page as a hidden gold/calibration page with a ground-truth transcript,
+    supplied directly or derived from an existing good annotation (assignment_id)."""
+    _require_page(page_name)
+    transcript = body.transcript
+    if body.assignment_id is not None:
+        transcript = scoring.transcript_from_boxes(
+            box_db.get_boxes_for_assignment(page_name, body.assignment_id)
+        )
+    if not transcript:
+        raise HTTPException(400, "Provide a transcript, or an assignment_id with annotated boxes")
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute(
+        "UPDATE pages SET is_gold = TRUE, gold_transcript = %s WHERE page_name = %s "
+        "RETURNING page_name, is_gold",
+        (transcript, page_name),
+    )
+    updated = dict(cur.fetchone())
+    conn.commit(); cur.close(); conn.close()
+    return updated
+
+
+@app.get("/admin/gold-scores")
+def admin_gold_scores(_: dict = Depends(require_admin)):
+    """Per-annotator calibration accuracy against gold pages; flags avg < 0.93."""
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("""
+        SELECT annotator,
+               COUNT(*)   AS pages_scored,
+               AVG(score) AS avg_score,
+               MIN(score) AS min_score,
+               MAX(at)    AS last_at
+        FROM gold_scores
+        GROUP BY annotator
+        ORDER BY avg_score ASC
+    """)
+    rows = []
+    for r in cur.fetchall():
+        d = dict(r)
+        d["flagged"] = d["avg_score"] is not None and d["avg_score"] < 0.93
+        rows.append(d)
     cur.close(); conn.close()
     return rows
 

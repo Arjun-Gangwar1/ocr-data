@@ -76,3 +76,9 @@ class MaskRegion(BaseModel):
 class MaskSubmit(BaseModel):
     regions: list[MaskRegion] = []
     model_config = {"extra": "ignore"}
+
+
+class GoldDesignate(BaseModel):
+    assignment_id: Optional[int] = None
+    transcript:    Optional[str] = None
+    model_config = {"extra": "ignore"}
