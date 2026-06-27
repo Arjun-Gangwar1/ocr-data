@@ -153,6 +153,22 @@ Make **`prabodha-ai/ocr-data`** the one platform by adopting `aperture-sud/annot
 
 ---
 
+## Configured policy & QC numbers (chosen 2026-06-27)
+
+**Gold pages:** kept **in the training set**, but **blind to everyone except admins** (the platform developers). `is_gold`/`gold_transcript` are stripped from `/my-pages`, `/my-uploads`, `/manager/pages`; gold metrics in `/admin/analytics/*` are returned only to admins; `set_gold` and `/admin/gold-scores` are admin-only. The dataset export does not reveal which pages are gold.
+
+**QC thresholds** — single source of truth `backend/scoring.py`; conservative / quality-first; match PIPELINE §§2,4,5,8. Change them there only.
+
+| Constant | Value | Meaning |
+|---|---|---|
+| `IAA_ACCEPT_THRESHOLD` | **0.98** | pair char-level agreement to auto-accept; below → adjudication |
+| `GOLD_CALIBRATION_PASS` | **0.95** | new-annotator calibration entry bar |
+| `GOLD_FLAG_THRESHOLD` | **0.93** | flag annotator when mean gold accuracy drops below this |
+| `ACCEPTANCE_RATE_TARGET` | **0.85** | reporting target (not enforced) |
+| `ASSIGNMENTS_PER_PAGE` | **2** | independent annotators per page (double-blind) |
+
+---
+
 ## Review findings — fixed vs. open
 
 `feat/qc-layer` was reviewed by three independent agent passes. **Fixed in-branch:** B2 route shadowing (`/export/dataset` → `/datasets/export`); `export_page` double-blind leak (now assignment-scoped); export canonical now prefers **tier-3 (adjudicated) then tier-1 (primary)**; annotator box edits blocked on `pending_approval`/`flagged_admin` and **re-submit blocked on an already-submitted assignment** (closes the `needs_adjudication` IAA-flip); `withdraw_page` now resets the assignment + clears stale IAA; box mutation restricted to annotator/manager/admin; approval cap-of-2 atomic (`FOR UPDATE`); **path-traversal in `/upload` closed** (allowlist medium/class/subject — also closes the Drive-query injection); **fail-fast on the default `JWT_SECRET`**. **Confirmed non-issue:** bbox units are normalised fractions (traced end-to-end).

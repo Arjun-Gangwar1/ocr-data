@@ -293,6 +293,14 @@ def _validate_folder_fields(medium: str, cls: str, subject: str):
         raise HTTPException(400, "Invalid medium, class, or subject")
 
 
+def _strip_gold(rows: list) -> list:
+    """Drop gold-test markers so gold pages stay blind to everyone but admins."""
+    for r in rows:
+        r.pop("is_gold", None)
+        r.pop("gold_transcript", None)
+    return rows
+
+
 def _next_student_id(cur, folder_id: int, m: str, c: str, s: str) -> int:
     id_prefix = f"{m}_{c}_{s}_id"
     cur.execute(
@@ -616,7 +624,7 @@ def my_uploads(current: dict = Depends(get_current_user)):
         WHERE d.uploaded_by = %s
         ORDER BY d.uploaded_at DESC, p.page_number ASC
     """, (current["username"],))
-    rows = [dict(r) for r in cur.fetchall()]
+    rows = _strip_gold([dict(r) for r in cur.fetchall()])
     cur.close(); conn.close()
     return rows
 
@@ -794,10 +802,12 @@ def my_pages(current: dict = Depends(get_current_user)):
         ORDER BY d.uploaded_at DESC, p.page_number ASC
     """, (current["username"], current["username"]))
     rows = [dict(r) for r in cur.fetchall()]
-    # Annotators must never receive the raw (un-redacted) image path
+    # Annotators never receive the raw image path or any gold-test markers
     for r in rows:
         r.pop("raw_image_path", None)
         r.pop("crop_corners", None)
+        r.pop("is_gold", None)
+        r.pop("gold_transcript", None)
     cur.close(); conn.close()
     return rows
 
@@ -883,7 +893,7 @@ def approve_annotation_request(req_id: int, current: dict = Depends(get_current_
         JOIN documents d ON d.id = p.doc_id
         WHERE d.folder_id = %s
           AND p.upload_approval_status = 'approved' AND p.mask_status = 'done'
-          AND (SELECT COUNT(*) FROM assignments a WHERE a.page_name = p.page_name) < 2
+          AND (SELECT COUNT(*) FROM assignments a WHERE a.page_name = p.page_name) < %s
           AND NOT EXISTS (
               SELECT 1 FROM assignments a2
               WHERE a2.page_name = p.page_name AND a2.annotator = %s
@@ -891,7 +901,7 @@ def approve_annotation_request(req_id: int, current: dict = Depends(get_current_
         ORDER BY d.uploaded_at ASC, p.page_number ASC
         LIMIT %s
         FOR UPDATE OF p
-    """, (req["folder_id"], req["requested_by"], req["quantity"]))
+    """, (req["folder_id"], scoring.ASSIGNMENTS_PER_PAGE, req["requested_by"], req["quantity"]))
     pages = [r["page_name"] for r in cur.fetchall()]
 
     if not pages:
@@ -1438,7 +1448,7 @@ def set_gold(page_name: str, body: schemas.GoldDesignate, _: dict = Depends(requ
 
 @app.get("/admin/gold-scores")
 def admin_gold_scores(_: dict = Depends(require_admin)):
-    """Per-annotator calibration accuracy against gold pages; flags avg < 0.93."""
+    """Per-annotator calibration accuracy against gold pages; flags avg below GOLD_FLAG_THRESHOLD."""
     conn = get_conn(); cur = conn.cursor()
     cur.execute("""
         SELECT annotator,
@@ -1453,7 +1463,7 @@ def admin_gold_scores(_: dict = Depends(require_admin)):
     rows = []
     for r in cur.fetchall():
         d = dict(r)
-        d["flagged"] = d["avg_score"] is not None and d["avg_score"] < 0.93
+        d["flagged"] = d["avg_score"] is not None and d["avg_score"] < scoring.GOLD_FLAG_THRESHOLD
         rows.append(d)
     cur.close(); conn.close()
     return rows
@@ -1462,7 +1472,7 @@ def admin_gold_scores(_: dict = Depends(require_admin)):
 # ── Analytics (B1) ────────────────────────────────────────────────────────────
 
 @app.get("/admin/analytics/annotators")
-def analytics_annotators(_: dict = Depends(require_manager)):
+def analytics_annotators(current: dict = Depends(require_manager)):
     """Per-annotator productivity + quality: assignments, throughput, IAA, gold."""
     conn = get_conn(); cur = conn.cursor()
     cur.execute("""
@@ -1491,14 +1501,21 @@ def analytics_annotators(_: dict = Depends(require_manager)):
     for d in stats.values():
         submitted = d.get("submitted") or 0
         d["acceptance_rate"] = ((d.get("approved") or 0) / submitted) if submitted else None
-        d["flagged"] = d.get("gold_avg") is not None and d["gold_avg"] < 0.93
+        d["flagged"] = d.get("gold_avg") is not None and d["gold_avg"] < scoring.GOLD_FLAG_THRESHOLD
         out.append(d)
-    out.sort(key=lambda x: (x.get("gold_avg") is None, x.get("gold_avg") or 0))
+    if current["role"] == "admin":
+        out.sort(key=lambda x: (x.get("gold_avg") is None, x.get("gold_avg") or 0))
+    else:
+        # Gold pages are hidden tests — blind to everyone but admins
+        for d in out:
+            for k in ("gold_pages", "gold_avg", "gold_min", "flagged"):
+                d.pop(k, None)
+        out.sort(key=lambda x: x.get("annotator") or "")
     return out
 
 
 @app.get("/admin/analytics/summary")
-def analytics_summary(_: dict = Depends(require_manager)):
+def analytics_summary(current: dict = Depends(require_manager)):
     """Project-level summary for the weekly PI dashboard (PIPELINE §12)."""
     conn = get_conn(); cur = conn.cursor()
     cur.execute("""
@@ -1521,6 +1538,9 @@ def analytics_summary(_: dict = Depends(require_manager)):
 
     reviewed = (s["approved"] or 0) + (s["needs_adjudication"] or 0) + (s["pending_approval"] or 0)
     s["acceptance_rate"] = ((s["approved"] or 0) / reviewed) if reviewed else None
+    if current["role"] != "admin":
+        for k in ("gold_pages", "gold_team_avg"):
+            s.pop(k, None)
     return s
 
 
@@ -1542,7 +1562,7 @@ def manager_pages(current: dict = Depends(require_manager)):
         GROUP BY p.page_name, d.doc_name, d.uploaded_at, d.uploaded_by, f.medium, f.cls, f.subject
         ORDER BY d.uploaded_at DESC, p.page_number ASC
     """)
-    rows = [dict(r) for r in cur.fetchall()]
+    rows = _strip_gold([dict(r) for r in cur.fetchall()])
     cur.close(); conn.close()
     return rows
 

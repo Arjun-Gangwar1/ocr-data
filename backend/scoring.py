@@ -68,8 +68,18 @@ def transcript_from_boxes(boxes: List[dict]) -> str:
     return "\n".join(parts)
 
 
-# Pages with IAA at or above this threshold are considered "agreed" (PIPELINE §2).
-IAA_ACCEPT_THRESHOLD = 0.98
+# ── QC thresholds — chosen 2026-06-27, conservative / quality-first (PIPELINE §§2,4,5,8).
+#    Documented here as the single source of truth; change deliberately. ──
+# Page auto-accepts when the two annotators' char-level agreement is >= this; below -> adjudication.
+IAA_ACCEPT_THRESHOLD  = 0.98
+# A new annotator must reach this mean accuracy on calibration gold pages before real work.
+GOLD_CALIBRATION_PASS = 0.95
+# Ongoing: an annotator is flagged for review when mean gold accuracy drops below this.
+GOLD_FLAG_THRESHOLD   = 0.93
+# Reporting target only (not enforced): share of submitted pages that end accepted.
+ACCEPTANCE_RATE_TARGET = 0.85
+# Independent annotators per page (double-blind).
+ASSIGNMENTS_PER_PAGE  = 2
 
 
 if __name__ == "__main__":
