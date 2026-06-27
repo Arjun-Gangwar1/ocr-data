@@ -69,3 +69,9 @@ def require_manager(user: dict = Depends(get_current_user)) -> dict:
     if user["role"] not in ("manager", "admin"):
         raise HTTPException(status_code=403, detail="Manager access required")
     return user
+
+
+def require_masker(user: dict = Depends(get_current_user)) -> dict:
+    if user["role"] not in ("masker", "admin"):
+        raise HTTPException(status_code=403, detail="Masker access required")
+    return user

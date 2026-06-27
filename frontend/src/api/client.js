@@ -311,3 +311,13 @@ export async function unflagUpload(pageName) {
   const { data } = await API.patch(`/admin/pages/${encodeURIComponent(pageName)}/unflag-upload`);
   return data;
 }
+
+export async function getMaskerPages() {
+  const { data } = await API.get('/masker/pages');
+  return data;
+}
+
+export async function maskPage(pageName, regions) {
+  const { data } = await API.post(`/masker/pages/${encodeURIComponent(pageName)}/mask`, { regions });
+  return data;
+}

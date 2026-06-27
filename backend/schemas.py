@@ -63,3 +63,16 @@ class ReviewAction(BaseModel):
 class UploadApprovalAction(BaseModel):
     note: Optional[str] = None
     model_config = {"extra": "ignore"}
+
+
+class MaskRegion(BaseModel):
+    x: float
+    y: float
+    w: float
+    h: float
+    model_config = {"extra": "ignore"}
+
+
+class MaskSubmit(BaseModel):
+    regions: list[MaskRegion] = []
+    model_config = {"extra": "ignore"}

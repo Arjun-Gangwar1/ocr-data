@@ -21,7 +21,7 @@ import box_db
 import gdrive
 import schemas
 from auth import (create_token, get_current_user, hash_password,
-                  require_admin, require_manager, verify_password)
+                  require_admin, require_manager, require_masker, verify_password)
 from database import get_conn, init_db
 
 REPO_ROOT   = Path(__file__).parent.parent
@@ -150,7 +150,7 @@ def list_users(_: dict = Depends(require_admin)):
 
 @app.post("/users", status_code=201)
 def create_user(data: schemas.UserCreate, _: dict = Depends(require_admin)):
-    if data.role not in ("pictaker", "annotator", "manager", "admin"):
+    if data.role not in ("pictaker", "annotator", "masker", "manager", "admin"):
         raise HTTPException(400, "Invalid role")
     conn = get_conn()
     cur  = conn.cursor()
@@ -338,6 +338,29 @@ def _apply_warp(image_bytes: bytes, corners_norm: list) -> bytes:
 
     buf = io.BytesIO()
     Image.fromarray(cv2.cvtColor(result, cv2.COLOR_BGR2RGB)).save(buf, format="JPEG", quality=92, optimize=True)
+    return buf.getvalue()
+
+
+def _apply_redaction(image_bytes: bytes, regions: list) -> bytes:
+    """Burn opaque black rectangles over the given regions of an image.
+    regions: list of dicts with normalised x, y, w, h in [0, 1] (top-left origin).
+    Used to permanently mask student identifiers on the annotator-facing copy.
+    The raw original is never passed here, so it stays intact.
+    """
+    nparr = np.frombuffer(image_bytes, np.uint8)
+    img   = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    if img is None:
+        raise ValueError("Could not decode image")
+    h, w = img.shape[:2]
+    for r in regions:
+        x0 = max(0, min(int(round(float(r["x"]) * w)), w))
+        y0 = max(0, min(int(round(float(r["y"]) * h)), h))
+        x1 = max(0, min(int(round((float(r["x"]) + float(r["w"])) * w)), w))
+        y1 = max(0, min(int(round((float(r["y"]) + float(r["h"])) * h)), h))
+        if x1 > x0 and y1 > y0:
+            cv2.rectangle(img, (x0, y0), (x1, y1), (0, 0, 0), thickness=-1)
+    buf = io.BytesIO()
+    Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB)).save(buf, format="JPEG", quality=92, optimize=True)
     return buf.getvalue()
 
 
@@ -659,6 +682,81 @@ def admin_flag_upload(page_name: str, body: schemas.UploadApprovalAction, _: dic
     return updated
 
 
+# ── Masker: redact student identifiers before annotation ──────────────────────
+
+@app.get("/masker/pages")
+def masker_pages(_: dict = Depends(require_masker)):
+    """Queue of upload-approved pages still awaiting identifier redaction."""
+    conn = get_conn()
+    cur  = conn.cursor()
+    cur.execute("""
+        SELECT p.page_name, p.image_path, p.width, p.height, p.mask_status,
+               d.doc_name, d.uploaded_at, f.medium, f.cls, f.subject
+        FROM pages p
+        JOIN documents d ON d.id = p.doc_id
+        JOIN folders f ON f.id = d.folder_id
+        WHERE p.upload_approval_status = 'approved' AND p.mask_status = 'pending'
+          AND p.assigned_to IS NULL
+        ORDER BY d.uploaded_at ASC, p.page_number ASC
+    """)
+    rows = [dict(r) for r in cur.fetchall()]
+    cur.close(); conn.close()
+    return rows
+
+
+@app.post("/masker/pages/{page_name}/mask")
+def mask_page(page_name: str, body: schemas.MaskSubmit, current: dict = Depends(require_masker)):
+    """Burn black boxes over identifier regions on the annotator-facing image and
+    mark the page masked. An empty region list means 'no identifier present'.
+    The raw original (storage/raw) is left untouched and stays admin-only."""
+    conn = get_conn()
+    cur  = conn.cursor()
+    try:
+        cur.execute(
+            "SELECT image_path, upload_approval_status, mask_status FROM pages WHERE page_name = %s",
+            (page_name,),
+        )
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(404, "Page not found")
+        row = dict(row)
+        if row["upload_approval_status"] != "approved":
+            raise HTTPException(400, "Page upload is not approved yet")
+        if row["mask_status"] != "pending":
+            raise HTTPException(409, "Page is already masked")
+
+        regions = [r.model_dump() for r in body.regions]
+        if regions:
+            img_path = UPLOADS_DIR / row["image_path"]
+            try:
+                redacted = _apply_redaction(img_path.read_bytes(), regions)
+                img_path.write_bytes(redacted)
+            except Exception:
+                raise HTTPException(500, "Failed to apply redaction to the image")
+            gdrive.upload_async(redacted, f"uploads/{row['image_path']}")
+            for r in regions:
+                cur.execute(
+                    "INSERT INTO mask_regions (page_name, coordinates, created_by) VALUES (%s, %s, %s)",
+                    (page_name, json.dumps(r), current["username"]),
+                )
+
+        cur.execute(
+            "UPDATE pages SET mask_status = 'done' WHERE page_name = %s RETURNING page_name, mask_status",
+            (page_name,),
+        )
+        updated = dict(cur.fetchone())
+        conn.commit()
+        return updated
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception:
+        conn.rollback()
+        raise HTTPException(500, "Failed to mask page")
+    finally:
+        cur.close(); conn.close()
+
+
 # ── Annotator: assigned pages ─────────────────────────────────────────────────
 
 @app.get("/my-pages")
@@ -677,6 +775,10 @@ def my_pages(current: dict = Depends(get_current_user)):
         ORDER BY d.uploaded_at DESC, p.page_number ASC
     """, (current["username"],))
     rows = [dict(r) for r in cur.fetchall()]
+    # Annotators must never receive the raw (un-redacted) image path
+    for r in rows:
+        r.pop("raw_image_path", None)
+        r.pop("crop_corners", None)
     cur.close(); conn.close()
     return rows
 
@@ -735,17 +837,25 @@ def approve_annotation_request(req_id: int, current: dict = Depends(get_current_
     cur.execute("""
         SELECT p.page_name FROM pages p
         JOIN documents d ON d.id = p.doc_id
-        WHERE d.folder_id = %s AND p.assigned_to IS NULL AND p.upload_approval_status = 'approved'
+        WHERE d.folder_id = %s AND p.assigned_to IS NULL
+          AND p.upload_approval_status = 'approved' AND p.mask_status = 'done'
         ORDER BY d.uploaded_at ASC, p.page_number ASC
         LIMIT %s
     """, (req["folder_id"], req["quantity"]))
     pages = [r["page_name"] for r in cur.fetchall()]
 
-    if pages:
-        cur.execute(
-            "UPDATE pages SET assigned_to = %s, area = 'assigned' WHERE page_name = ANY(%s)",
-            (req["requested_by"], pages),
+    if not pages:
+        cur.close(); conn.close()
+        raise HTTPException(
+            400,
+            "No masked, upload-approved pages are available for this folder yet. "
+            "Mask pages first, then approve this request again.",
         )
+
+    cur.execute(
+        "UPDATE pages SET assigned_to = %s, area = 'assigned' WHERE page_name = ANY(%s)",
+        (req["requested_by"], pages),
+    )
 
     cur.execute("""
         UPDATE annotation_requests
@@ -930,7 +1040,8 @@ async def replace_page_image(page_name: str, file: UploadFile = File(...), corne
 
     cur.execute(
         """UPDATE pages
-           SET width = %s, height = %s, crop_corners = COALESCE(%s, crop_corners)
+           SET width = %s, height = %s, crop_corners = COALESCE(%s, crop_corners),
+               mask_status = 'pending'
                {reset}
            WHERE page_name = %s""".format(
             reset=", upload_approval_status = 'redo'" if was_flagged else ""

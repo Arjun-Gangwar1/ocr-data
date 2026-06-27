@@ -26,7 +26,7 @@ def init_db():
             id            SERIAL PRIMARY KEY,
             username      TEXT UNIQUE NOT NULL,
             password_hash TEXT NOT NULL,
-            role          TEXT NOT NULL CHECK (role IN ('pictaker','annotator','manager','admin')),
+            role          TEXT NOT NULL CHECK (role IN ('pictaker','annotator','masker','manager','admin')),
             created_at    TIMESTAMP DEFAULT NOW()
         );
         CREATE TABLE IF NOT EXISTS folders (
@@ -61,6 +61,7 @@ def init_db():
             reviewed_at            TIMESTAMP,
             upload_approval_status TEXT NOT NULL DEFAULT 'pending',
             upload_approval_note   TEXT,
+            mask_status            TEXT NOT NULL DEFAULT 'pending',
             CONSTRAINT pages_doc_id_fk FOREIGN KEY (doc_id) REFERENCES documents(id) ON DELETE CASCADE
         );
         CREATE TABLE IF NOT EXISTS boxes (
@@ -90,6 +91,15 @@ def init_db():
             reviewed_at  TIMESTAMP,
             CONSTRAINT annotation_requests_folder_id_fk FOREIGN KEY (folder_id) REFERENCES folders(id)
         );
+        CREATE TABLE IF NOT EXISTS mask_regions (
+            id          SERIAL PRIMARY KEY,
+            page_name   TEXT NOT NULL,
+            coordinates TEXT NOT NULL,
+            created_by  TEXT,
+            created_at  TIMESTAMP DEFAULT NOW(),
+            CONSTRAINT mask_regions_page_name_fk FOREIGN KEY (page_name)
+                REFERENCES pages(page_name) ON DELETE CASCADE ON UPDATE CASCADE
+        );
     """)
 
     # Add new columns to existing installs
@@ -107,10 +117,27 @@ def init_db():
         "reviewed_at            TIMESTAMP",
         "upload_approval_status TEXT NOT NULL DEFAULT 'pending'",
         "upload_approval_note   TEXT",
+        "mask_status            TEXT NOT NULL DEFAULT 'pending'",
     ]:
         cur.execute(f"ALTER TABLE pages ADD COLUMN IF NOT EXISTS {col_def}")
 
     cur.execute("ALTER TABLE annotation_requests ADD COLUMN IF NOT EXISTS folder_id INTEGER")
+
+    # Widen users.role CHECK to include the 'masker' role (for existing installs)
+    cur.execute("""
+        DO $$
+        DECLARE c text;
+        BEGIN
+            SELECT conname INTO c FROM pg_constraint
+              WHERE conrelid = 'users'::regclass AND contype = 'c'
+                AND pg_get_constraintdef(oid) ILIKE '%role%';
+            IF c IS NOT NULL THEN
+                EXECUTE 'ALTER TABLE users DROP CONSTRAINT ' || quote_ident(c);
+            END IF;
+            ALTER TABLE users ADD CONSTRAINT users_role_check
+              CHECK (role IN ('pictaker','annotator','masker','manager','admin'));
+        END $$;
+    """)
 
     # Populate folders from annotation_requests (always safe — those columns are kept)
     cur.execute("""
@@ -225,6 +252,11 @@ def init_db():
     cur.execute("CREATE INDEX IF NOT EXISTS idx_pages_doc_id ON pages(doc_id)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_pages_area ON pages(area)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_pages_assigned_to ON pages(assigned_to)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_pages_mask_status ON pages(mask_status)")
+
+    # Pages already assigned/annotated pre-date the masker stage — treat them as masked
+    # so they neither flood the masker queue nor get re-masked over live annotation work.
+    cur.execute("UPDATE pages SET mask_status = 'done' WHERE assigned_to IS NOT NULL AND mask_status = 'pending'")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_documents_folder_id ON documents(folder_id)")
 
     # Ensure FK with ON DELETE CASCADE + ON UPDATE CASCADE for boxes

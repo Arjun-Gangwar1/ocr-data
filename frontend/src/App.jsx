@@ -9,6 +9,7 @@ import AdminPage from './pages/AdminPage.jsx';
 import PictakerPage from './pages/PictakerPage.jsx';
 import AnnotatorPage from './pages/AnnotatorPage.jsx';
 import ManagerPage from './pages/ManagerPage.jsx';
+import MaskerPage from './pages/MaskerPage.jsx';
 import { useAuth } from './context/AuthContext.jsx';
 
 function RootRedirect() {
@@ -16,6 +17,7 @@ function RootRedirect() {
   if (user?.role === 'annotator') return <Navigate to="/annotator" replace />;
   if (user?.role === 'manager')   return <Navigate to="/manager" replace />;
   if (user?.role === 'pictaker')  return <Navigate to="/pictaker" replace />;
+  if (user?.role === 'masker')    return <Navigate to="/masker" replace />;
   return <HomePage />;
 }
 
@@ -32,6 +34,7 @@ export default function App() {
           <Route path="/pictaker" element={<ProtectedRoute roles={['pictaker']}><PictakerPage /></ProtectedRoute>} />
           <Route path="/annotator" element={<ProtectedRoute roles={['annotator']}><AnnotatorPage /></ProtectedRoute>} />
           <Route path="/manager"  element={<ProtectedRoute roles={['manager', 'admin']}><ManagerPage /></ProtectedRoute>} />
+          <Route path="/masker"   element={<ProtectedRoute roles={['masker', 'admin']}><MaskerPage /></ProtectedRoute>} />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>
       </BrowserRouter>
