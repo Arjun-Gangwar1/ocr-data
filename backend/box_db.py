@@ -17,16 +17,30 @@ def get_boxes(page_name: str) -> list:
     return [dict(r) for r in rows]
 
 
+def get_boxes_for_assignment(page_name: str, assignment_id: int) -> list:
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT * FROM boxes WHERE page_name = %s AND assignment_id = %s
+        ORDER BY CASE WHEN reading_order IS NULL THEN 1 ELSE 0 END, reading_order, id
+    """, (page_name, assignment_id))
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
 def insert_box(page_name: str, data: dict) -> dict:
     conn = get_conn()
     cur = conn.cursor()
     cur.execute("""
-        INSERT INTO boxes (page_name, parent_id, coordinates, tag_category, tag_attributes,
+        INSERT INTO boxes (page_name, assignment_id, parent_id, coordinates, tag_category, tag_attributes,
                            content_text, reading_order, confidence)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
         RETURNING *
     """, (
         page_name,
+        data.get("assignment_id"),
         data.get("parent_id"),
         data.get("coordinates", "[]"),
         data.get("tag_category"),

@@ -20,6 +20,7 @@ import io
 import box_db
 import gdrive
 import schemas
+import scoring
 from auth import (create_token, get_current_user, hash_password,
                   require_admin, require_manager, require_masker, verify_password)
 from database import get_conn, init_db
@@ -764,21 +765,44 @@ def my_pages(current: dict = Depends(get_current_user)):
     conn = get_conn()
     cur  = conn.cursor()
     cur.execute("""
-        SELECT p.*, COUNT(b.id) AS box_count,
+        SELECT p.*,
+               (SELECT COUNT(*) FROM boxes b
+                JOIN assignments a ON a.id = b.assignment_id
+                WHERE a.page_name = p.page_name AND a.annotator = %s) AS box_count,
                d.doc_name, d.uploaded_at, f.medium, f.cls, f.subject
         FROM pages p
-        LEFT JOIN boxes b ON b.page_name = p.page_name
         JOIN documents d ON d.id = p.doc_id
         JOIN folders f ON f.id = d.folder_id
         WHERE p.assigned_to = %s
-        GROUP BY p.page_name, d.doc_name, d.uploaded_at, f.medium, f.cls, f.subject
         ORDER BY d.uploaded_at DESC, p.page_number ASC
-    """, (current["username"],))
+    """, (current["username"], current["username"]))
     rows = [dict(r) for r in cur.fetchall()]
     # Annotators must never receive the raw (un-redacted) image path
     for r in rows:
         r.pop("raw_image_path", None)
         r.pop("crop_corners", None)
+    cur.close(); conn.close()
+    return rows
+
+
+@app.get("/my-assignments")
+def my_assignments(current: dict = Depends(get_current_user)):
+    """Double-blind view: the caller's own assignments (their boxes only)."""
+    conn = get_conn()
+    cur  = conn.cursor()
+    cur.execute("""
+        SELECT a.id AS assignment_id, a.tier, a.status AS assignment_status, a.submitted_at,
+               p.page_name, p.area, p.iaa, p.iaa_status,
+               d.doc_name, f.medium, f.cls, f.subject,
+               (SELECT COUNT(*) FROM boxes b WHERE b.assignment_id = a.id) AS box_count
+        FROM assignments a
+        JOIN pages p ON p.page_name = a.page_name
+        JOIN documents d ON d.id = p.doc_id
+        JOIN folders f ON f.id = d.folder_id
+        WHERE a.annotator = %s
+        ORDER BY a.assigned_at DESC, p.page_number ASC
+    """, (current["username"],))
+    rows = [dict(r) for r in cur.fetchall()]
     cur.close(); conn.close()
     return rows
 
@@ -834,34 +858,59 @@ def approve_annotation_request(req_id: int, current: dict = Depends(get_current_
     if not req.get("folder_id"):
         cur.close(); conn.close(); raise HTTPException(400, "Request has no folder — re-submit the request")
 
+    # Candidate pages: masked + upload-approved, that still need an annotator
+    # (fewer than 2 assignments) and that this annotator does not already have.
     cur.execute("""
         SELECT p.page_name FROM pages p
         JOIN documents d ON d.id = p.doc_id
-        WHERE d.folder_id = %s AND p.assigned_to IS NULL
+        WHERE d.folder_id = %s
           AND p.upload_approval_status = 'approved' AND p.mask_status = 'done'
+          AND (SELECT COUNT(*) FROM assignments a WHERE a.page_name = p.page_name) < 2
+          AND NOT EXISTS (
+              SELECT 1 FROM assignments a2
+              WHERE a2.page_name = p.page_name AND a2.annotator = %s
+          )
         ORDER BY d.uploaded_at ASC, p.page_number ASC
         LIMIT %s
-    """, (req["folder_id"], req["quantity"]))
+    """, (req["folder_id"], req["requested_by"], req["quantity"]))
     pages = [r["page_name"] for r in cur.fetchall()]
 
     if not pages:
         cur.close(); conn.close()
         raise HTTPException(
             400,
-            "No masked, upload-approved pages are available for this folder yet. "
-            "Mask pages first, then approve this request again.",
+            "No masked, upload-approved pages are available for this folder yet "
+            "(remaining pages may already have two annotators). Mask more pages or wait, then approve again.",
         )
 
-    cur.execute(
-        "UPDATE pages SET assigned_to = %s, area = 'assigned' WHERE page_name = ANY(%s)",
-        (req["requested_by"], pages),
-    )
+    # One assignment per page: tier 1 = primary annotator, tier 2 = independent reviewer.
+    assigned = []
+    for pname in pages:
+        cur.execute("SELECT COUNT(*) AS c FROM assignments WHERE page_name = %s", (pname,))
+        tier = cur.fetchone()["c"] + 1
+        cur.execute(
+            "INSERT INTO assignments (page_name, annotator, tier, status) "
+            "VALUES (%s, %s, %s, 'assigned') ON CONFLICT (page_name, annotator) DO NOTHING RETURNING id",
+            (pname, req["requested_by"], tier),
+        )
+        if cur.fetchone() is None:
+            continue
+        assigned.append(pname)
+        if tier == 1:
+            cur.execute(
+                "UPDATE pages SET assigned_to = %s, area = 'assigned' WHERE page_name = %s",
+                (req["requested_by"], pname),
+            )
+
+    if not assigned:
+        conn.rollback(); cur.close(); conn.close()
+        raise HTTPException(400, "No pages could be assigned (they may have just been taken). Try again.")
 
     cur.execute("""
         UPDATE annotation_requests
         SET status = 'approved', reviewed_by = %s, reviewed_at = NOW(), fulfilled = %s
         WHERE id = %s RETURNING *
-    """, (current["username"], len(pages), req_id))
+    """, (current["username"], len(assigned), req_id))
     updated = dict(cur.fetchone())
     conn.commit(); cur.close(); conn.close()
     return updated
@@ -1087,21 +1136,58 @@ def delete_page(page_name: str, current: dict = Depends(get_current_user)):
 
 # ── Boxes ─────────────────────────────────────────────────────────────────────
 
+def _assignment_for(cur, page_name: str, username: str):
+    """Return the caller's assignment row for a page, or None."""
+    cur.execute("SELECT * FROM assignments WHERE page_name = %s AND annotator = %s", (page_name, username))
+    r = cur.fetchone()
+    return dict(r) if r else None
+
+
+def _require_own_box(page_name: str, box_id: int, current: dict):
+    """Ensure an annotator only mutates boxes in their own assignment (double-blind)."""
+    existing = box_db.fetch_box(page_name, box_id)
+    if existing is None:
+        raise HTTPException(404, "Box not found")
+    conn = get_conn(); cur = conn.cursor()
+    try:
+        a = _assignment_for(cur, page_name, current["username"])
+    finally:
+        cur.close(); conn.close()
+    if not a or existing.get("assignment_id") != a["id"]:
+        raise HTTPException(403, "Not your annotation")
+
+
 @app.get("/pages/{page_name}/boxes")
-def get_page_boxes(page_name: str, _: dict = Depends(get_current_user)):
+def get_page_boxes(page_name: str, current: dict = Depends(get_current_user)):
     _require_page(page_name)
+    # Annotators see only their own assignment's boxes; reviewers/admins see all.
+    if current["role"] == "annotator":
+        conn = get_conn(); cur = conn.cursor()
+        a = _assignment_for(cur, page_name, current["username"])
+        cur.close(); conn.close()
+        return box_db.get_boxes_for_assignment(page_name, a["id"]) if a else []
     return box_db.get_boxes(page_name)
 
 
 @app.post("/pages/{page_name}/boxes")
 def create_box(page_name: str, box: schemas.BoxCreate, current: dict = Depends(get_current_user)):
     _require_editable_page(page_name, current)
-    return box_db.insert_box(page_name, box.model_dump())
+    data = box.model_dump()
+    if current["role"] == "annotator":
+        conn = get_conn(); cur = conn.cursor()
+        a = _assignment_for(cur, page_name, current["username"])
+        cur.close(); conn.close()
+        if not a:
+            raise HTTPException(403, "You are not assigned to this page")
+        data["assignment_id"] = a["id"]
+    return box_db.insert_box(page_name, data)
 
 
 @app.put("/pages/{page_name}/boxes/{box_id}")
 def update_box(page_name: str, box_id: int, data: schemas.BoxUpdate, current: dict = Depends(get_current_user)):
     _require_editable_page(page_name, current)
+    if current["role"] == "annotator":
+        _require_own_box(page_name, box_id, current)
     result = box_db.update_box(page_name, box_id, data.model_dump(exclude_unset=True))
     if result is None:
         raise HTTPException(404, "Box not found")
@@ -1111,6 +1197,8 @@ def update_box(page_name: str, box_id: int, data: schemas.BoxUpdate, current: di
 @app.delete("/pages/{page_name}/boxes/{box_id}")
 def delete_box(page_name: str, box_id: int, current: dict = Depends(get_current_user)):
     _require_editable_page(page_name, current)
+    if current["role"] == "annotator":
+        _require_own_box(page_name, box_id, current)
     box_db.remove_box(page_name, box_id)
     return {"deleted": box_id}
 
@@ -1146,25 +1234,113 @@ def withdraw_page(page_name: str, current: dict = Depends(get_current_user)):
 def submit_page(page_name: str, current: dict = Depends(get_current_user)):
     conn = get_conn()
     cur  = conn.cursor()
-    cur.execute("SELECT assigned_to, area FROM pages WHERE page_name = %s", (page_name,))
+    try:
+        # Lock the page row so two annotators submitting at once serialise here
+        # (otherwise neither observes the other's submission and IAA never fires).
+        cur.execute("SELECT assigned_to, area FROM pages WHERE page_name = %s FOR UPDATE", (page_name,))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(404, "Page not found")
+        row = dict(row)
+        if row["area"] in ("approved", "flagged_admin"):
+            raise HTTPException(400, "Page is already finalised")
+
+        a = _assignment_for(cur, page_name, current["username"])
+        if a is None and current["role"] not in ("manager", "admin") and row["assigned_to"] != current["username"]:
+            raise HTTPException(403, "Not your page")
+
+        # Mark the caller's own assignment submitted
+        if a is not None:
+            cur.execute(
+                "UPDATE assignments SET status = 'submitted', submitted_at = NOW() WHERE id = %s",
+                (a["id"],),
+            )
+
+        cur.execute(
+            "SELECT id, annotator, tier, status FROM assignments WHERE page_name = %s ORDER BY tier, id",
+            (page_name,),
+        )
+        assigns = [dict(r) for r in cur.fetchall()]
+        submitted = [x for x in assigns if x["status"] == "submitted"]
+
+        if len(assigns) >= 2 and len(submitted) >= 2:
+            # Double-blind pair complete → compute inter-annotator agreement
+            t1 = scoring.transcript_from_boxes(box_db.get_boxes_for_assignment(page_name, submitted[0]["id"]))
+            t2 = scoring.transcript_from_boxes(box_db.get_boxes_for_assignment(page_name, submitted[1]["id"]))
+            if not t1 and not t2:
+                # Two empty transcripts must not auto-accept — route to adjudication.
+                score, new_area, iaa_status = 0.0, "needs_adjudication", "disagreed"
+            elif scoring.agreement(t1, t2) >= scoring.IAA_ACCEPT_THRESHOLD:
+                score, new_area, iaa_status = scoring.agreement(t1, t2), "pending_approval", "agreed"
+            else:
+                score, new_area, iaa_status = scoring.agreement(t1, t2), "needs_adjudication", "disagreed"
+            cur.execute(
+                "UPDATE pages SET area = %s, iaa = %s, iaa_status = %s, review_note = NULL "
+                "WHERE page_name = %s RETURNING *",
+                (new_area, score, iaa_status, page_name),
+            )
+            updated = dict(cur.fetchone())
+        elif len(assigns) >= 2:
+            # Second annotator not done yet — leave the page in progress
+            updated = {"page_name": page_name, "area": row["area"], "iaa_status": "awaiting_pair"}
+        else:
+            # Legacy single-annotator flow (unchanged): straight to manager review
+            if row["area"] not in ("assigned", "needs_rework", "pending_approval"):
+                raise HTTPException(400, f"Cannot submit page with status '{row['area']}'")
+            cur.execute(
+                "UPDATE pages SET area = 'pending_approval', review_note = NULL WHERE page_name = %s RETURNING *",
+                (page_name,),
+            )
+            updated = dict(cur.fetchone())
+
+        for k in ("raw_image_path", "crop_corners"):
+            updated.pop(k, None)
+        conn.commit()
+        return updated
+    except HTTPException:
+        conn.rollback(); raise
+    except Exception:
+        conn.rollback(); raise HTTPException(500, "Failed to submit page")
+    finally:
+        cur.close(); conn.close()
+
+
+@app.get("/pages/{page_name}/iaa")
+def page_iaa(page_name: str, _: dict = Depends(require_manager)):
+    conn = get_conn()
+    cur  = conn.cursor()
+    cur.execute("SELECT iaa, iaa_status FROM pages WHERE page_name = %s", (page_name,))
     row = cur.fetchone()
     if not row:
         cur.close(); conn.close()
         raise HTTPException(404, "Page not found")
-    row = dict(row)
-    if row["assigned_to"] != current["username"] and current["role"] not in ("manager", "admin"):
-        cur.close(); conn.close()
-        raise HTTPException(403, "Not your page")
-    if row["area"] not in ("assigned", "needs_rework", "pending_approval"):
-        cur.close(); conn.close()
-        raise HTTPException(400, f"Cannot submit page with status '{row['area']}'")
     cur.execute(
-        "UPDATE pages SET area = 'pending_approval', review_note = NULL WHERE page_name = %s RETURNING *",
+        "SELECT id AS assignment_id, annotator, tier, status, submitted_at "
+        "FROM assignments WHERE page_name = %s ORDER BY tier, id",
         (page_name,),
     )
-    updated = dict(cur.fetchone())
-    conn.commit(); cur.close(); conn.close()
-    return updated
+    assigns = [dict(r) for r in cur.fetchall()]
+    cur.close(); conn.close()
+    return {"page_name": page_name, **dict(row), "assignments": assigns}
+
+
+@app.get("/adjudication")
+def adjudication_queue(_: dict = Depends(require_manager)):
+    """Pages where the two annotators disagreed (IAA below threshold)."""
+    conn = get_conn()
+    cur  = conn.cursor()
+    cur.execute("""
+        SELECT p.page_name, p.iaa, p.iaa_status, p.page_number,
+               d.doc_name, f.medium, f.cls, f.subject
+        FROM pages p
+        JOIN documents d ON d.id = p.doc_id
+        JOIN folders f ON f.id = d.folder_id
+        WHERE p.area = 'needs_adjudication'
+        ORDER BY p.iaa ASC NULLS FIRST, d.uploaded_at ASC
+    """)
+    rows = [dict(r) for r in cur.fetchall()]
+    cur.close(); conn.close()
+    return rows
 
 
 # ── Manager: review queue ─────────────────────────────────────────────────────

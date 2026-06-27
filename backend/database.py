@@ -67,6 +67,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS boxes (
             id             SERIAL PRIMARY KEY,
             page_name      TEXT NOT NULL,
+            assignment_id  INTEGER,
             parent_id      INTEGER,
             coordinates    TEXT NOT NULL DEFAULT '[]',
             tag_category   TEXT,
@@ -98,6 +99,19 @@ def init_db():
             created_by  TEXT,
             created_at  TIMESTAMP DEFAULT NOW(),
             CONSTRAINT mask_regions_page_name_fk FOREIGN KEY (page_name)
+                REFERENCES pages(page_name) ON DELETE CASCADE ON UPDATE CASCADE
+        );
+        CREATE TABLE IF NOT EXISTS assignments (
+            id           SERIAL PRIMARY KEY,
+            page_name    TEXT NOT NULL,
+            annotator    TEXT NOT NULL,
+            tier         INTEGER NOT NULL DEFAULT 1,
+            status       TEXT NOT NULL DEFAULT 'assigned',
+            review_note  TEXT,
+            assigned_at  TIMESTAMP DEFAULT NOW(),
+            submitted_at TIMESTAMP,
+            UNIQUE(page_name, annotator),
+            CONSTRAINT assignments_page_name_fk FOREIGN KEY (page_name)
                 REFERENCES pages(page_name) ON DELETE CASCADE ON UPDATE CASCADE
         );
     """)
@@ -257,6 +271,44 @@ def init_db():
     # Pages already assigned/annotated pre-date the masker stage — treat them as masked
     # so they neither flood the masker queue nor get re-masked over live annotation work.
     cur.execute("UPDATE pages SET mask_status = 'done' WHERE assigned_to IS NOT NULL AND mask_status = 'pending'")
+
+    # ── A1: double-blind assignments + inter-annotator agreement ──
+    cur.execute("ALTER TABLE boxes ADD COLUMN IF NOT EXISTS assignment_id INTEGER")
+    cur.execute("ALTER TABLE pages ADD COLUMN IF NOT EXISTS iaa REAL")
+    cur.execute("ALTER TABLE pages ADD COLUMN IF NOT EXISTS iaa_status TEXT")
+    cur.execute("""
+        DO $$
+        BEGIN
+            IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'boxes_assignment_id_fk') THEN
+                ALTER TABLE boxes ADD CONSTRAINT boxes_assignment_id_fk
+                    FOREIGN KEY (assignment_id) REFERENCES assignments(id) ON DELETE CASCADE;
+            END IF;
+        END $$;
+    """)
+    # One-time backfill: a tier-1 assignment per existing assigned page + attach its
+    # boxes. Gated on an empty assignments table so it never re-runs (re-running would
+    # capture manager/admin-created NULL-assignment boxes and corrupt double-blind sets).
+    cur.execute("SELECT COUNT(*) AS c FROM assignments")
+    if cur.fetchone()["c"] == 0:
+        cur.execute("""
+            INSERT INTO assignments (page_name, annotator, tier, status, submitted_at)
+            SELECT p.page_name, p.assigned_to, 1,
+                   CASE WHEN p.area IN ('pending_approval','approved','needs_rework','flagged_admin')
+                        THEN 'submitted' ELSE 'assigned' END,
+                   CASE WHEN p.area IN ('pending_approval','approved','needs_rework','flagged_admin')
+                        THEN NOW() ELSE NULL END
+            FROM pages p
+            WHERE p.assigned_to IS NOT NULL
+            ON CONFLICT (page_name, annotator) DO NOTHING
+        """)
+        cur.execute("""
+            UPDATE boxes b SET assignment_id = a.id
+            FROM assignments a
+            WHERE b.assignment_id IS NULL AND a.page_name = b.page_name AND a.tier = 1
+        """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_assignments_page ON assignments(page_name)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_assignments_annotator ON assignments(annotator)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_boxes_assignment ON boxes(assignment_id)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_documents_folder_id ON documents(folder_id)")
 
     # Ensure FK with ON DELETE CASCADE + ON UPDATE CASCADE for boxes

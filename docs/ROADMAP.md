@@ -91,6 +91,21 @@ ALTER TABLE boxes ADD COLUMN assignment_id INTEGER REFERENCES assignments(id) ON
 - IAA is computed and stored; ≥98% auto-accepts; <98% creates a tier-3 task.
 - Existing single-annotator data migrates without loss.
 
+### Implemented in `feat/qc-layer` (backend) — follow-ups for #4
+**Done:** `assignments` table + `boxes.assignment_id` (+ one-time backfill); `scoring.py`
+(char-level CER / agreement, self-tested); dual-assignment in request approval (tier 1/2,
+cap 2/page); assignment-scoped box read/write (annotators isolated; managers/admins see
+all); `submit` computes IAA on pair completion (page row `FOR UPDATE` to serialise the two
+submits); `needs_adjudication` on disagreement; `GET /my-assignments`, `GET /pages/{name}/iaa`
+(manager-only), `GET /adjudication`.
+
+**Follow-ups for #4 (frontend + adjudication):**
+- **Annotator UI must switch from `/my-pages` to `/my-assignments`** — `/my-pages` keys off `assigned_to` (tier-1 only), so a tier-2 annotator's work is invisible there.
+- **Canonical boxes for accepted pages:** an "agreed" page still has *two* box sets; pick tier-1 (or the adjudicated tier-3) as canonical for manager view / B2 export.
+- **Tier-3 adjudication:** auto-create a tier-3 assignment for `needs_adjudication` pages, build the side-by-side view, and on tier-3 submit set `area='approved'`.
+- **Concurrency:** the 2-assignments-per-page cap is enforced sequentially, not by a DB constraint — add a row lock / partial unique index if concurrent approvals become possible.
+- Optionally lock an annotator's boxes once their assignment is `submitted` (today only terminal page states block re-submit).
+
 ---
 
 ## PR-2 — B3: Annotation history / audit trail
