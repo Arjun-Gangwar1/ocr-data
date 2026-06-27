@@ -301,6 +301,17 @@ def _strip_gold(rows: list) -> list:
     return rows
 
 
+def _strip_page(d: dict, role: str) -> dict:
+    """Strip fields that must not reach a single page-row response: the raw image
+    path, crop corners, and — for non-admins — the gold-test markers."""
+    d.pop("raw_image_path", None)
+    d.pop("crop_corners", None)
+    if role != "admin":
+        d.pop("is_gold", None)
+        d.pop("gold_transcript", None)
+    return d
+
+
 def _next_student_id(cur, folder_id: int, m: str, c: str, s: str) -> int:
     id_prefix = f"{m}_{c}_{s}_id"
     cur.execute(
@@ -916,7 +927,10 @@ def approve_annotation_request(req_id: int, current: dict = Depends(get_current_
     assigned = []
     for pname in pages:
         cur.execute("SELECT COUNT(*) AS c FROM assignments WHERE page_name = %s", (pname,))
-        tier = cur.fetchone()["c"] + 1
+        c = cur.fetchone()["c"]
+        if c >= scoring.ASSIGNMENTS_PER_PAGE:
+            continue  # re-check the cap under FOR UPDATE to close the race
+        tier = c + 1
         cur.execute(
             "INSERT INTO assignments (page_name, annotator, tier, status) "
             "VALUES (%s, %s, %s, 'assigned') ON CONFLICT (page_name, annotator) DO NOTHING RETURNING id",
@@ -1184,6 +1198,8 @@ def _require_own_box(page_name: str, box_id: int, current: dict):
         cur.close(); conn.close()
     if not a or existing.get("assignment_id") != a["id"]:
         raise HTTPException(403, "Not your annotation")
+    if a["status"] == "submitted":
+        raise HTTPException(403, "Your annotation is submitted — withdraw to edit")
 
 
 @app.get("/pages/{page_name}/boxes")
@@ -1208,6 +1224,8 @@ def create_box(page_name: str, box: schemas.BoxCreate, current: dict = Depends(g
         cur.close(); conn.close()
         if not a:
             raise HTTPException(403, "You are not assigned to this page")
+        if a["status"] == "submitted":
+            raise HTTPException(403, "Your annotation is submitted — withdraw to edit")
         data["assignment_id"] = a["id"]
     return box_db.insert_box(page_name, data, actor=current["username"])
 
@@ -1275,9 +1293,7 @@ def withdraw_page(page_name: str, current: dict = Depends(get_current_user)):
         "UPDATE pages SET area = 'assigned', iaa = NULL, iaa_status = NULL WHERE page_name = %s RETURNING *",
         (page_name,),
     )
-    updated = dict(cur.fetchone())
-    for k in ("raw_image_path", "crop_corners"):
-        updated.pop(k, None)
+    updated = _strip_page(dict(cur.fetchone()), current["role"])
     conn.commit(); cur.close(); conn.close()
     return updated
 
@@ -1364,8 +1380,7 @@ def submit_page(page_name: str, current: dict = Depends(get_current_user)):
             )
             updated = dict(cur.fetchone())
 
-        for k in ("raw_image_path", "crop_corners"):
-            updated.pop(k, None)
+        _strip_page(updated, current["role"])
         conn.commit()
         return updated
     except HTTPException:
@@ -1579,7 +1594,7 @@ def manager_approve(page_name: str, current: dict = Depends(require_manager)):
         SET area = 'approved', review_note = NULL, reviewed_by = %s, reviewed_at = NOW()
         WHERE page_name = %s RETURNING *
     """, (current["username"], page_name))
-    updated = dict(cur.fetchone())
+    updated = _strip_page(dict(cur.fetchone()), current["role"])
     conn.commit(); cur.close(); conn.close()
     return updated
 
@@ -1596,7 +1611,13 @@ def manager_send_back(page_name: str, body: schemas.ReviewAction, current: dict 
         SET area = 'needs_rework', review_note = %s, reviewed_by = %s, reviewed_at = NOW()
         WHERE page_name = %s RETURNING *
     """, (body.note, current["username"], page_name))
-    updated = dict(cur.fetchone())
+    updated = _strip_page(dict(cur.fetchone()), current["role"])
+    # Re-open the submitted assignments so the annotator(s) can rework
+    cur.execute(
+        "UPDATE assignments SET status = 'assigned', submitted_at = NULL "
+        "WHERE page_name = %s AND status = 'submitted'",
+        (page_name,),
+    )
     conn.commit(); cur.close(); conn.close()
     return updated
 
@@ -1613,7 +1634,7 @@ def manager_flag_admin(page_name: str, body: schemas.ReviewAction, current: dict
         SET area = 'flagged_admin', review_note = %s, reviewed_by = %s, reviewed_at = NOW()
         WHERE page_name = %s RETURNING *
     """, (body.note, current["username"], page_name))
-    updated = dict(cur.fetchone())
+    updated = _strip_page(dict(cur.fetchone()), current["role"])
     conn.commit(); cur.close(); conn.close()
     return updated
 
@@ -1968,6 +1989,8 @@ def _render_tree(box, children_map, indent):
 
 @app.get("/export/{page_name}", response_class=PlainTextResponse)
 def export_page(page_name: str, current: dict = Depends(get_current_user)):
+    if current["role"] not in ("annotator", "manager", "admin"):
+        raise HTTPException(403, "Not allowed")
     conn = get_conn()
     cur = conn.cursor()
     cur.execute("SELECT page_number FROM pages WHERE page_name = %s", (page_name,))
