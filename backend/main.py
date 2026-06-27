@@ -1866,3 +1866,107 @@ def export_page(page_name: str, _: dict = Depends(get_current_user)):
     return (f"\\begin{{page}}{{{page_number}}}\n\n"
             f"{inner}\n\n"
             f"\\end{{page}}")
+
+
+# ── Standard training export (B2) ─────────────────────────────────────────────
+# NOTE: box `coordinates` are stored as normalised fractions (0..1) of the image
+# (see legacy README). bbox_norm is [x, y, w, h] in fractions; bbox_px is pixels
+# when the page width/height are known.
+
+def _bbox_from_coords(coords_json):
+    try:
+        pts = json.loads(coords_json or "[]")
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not pts:
+        return None
+    xs = [p[0] for p in pts]
+    ys = [p[1] for p in pts]
+    x, y = min(xs), min(ys)
+    return [x, y, max(xs) - x, max(ys) - y]
+
+
+def _dataset_record(page: dict, boxes: list) -> dict:
+    out = []
+    for b in boxes:
+        try:
+            td = json.loads(b.get("tag_attributes") or "{}")
+        except (json.JSONDecodeError, TypeError):
+            td = {}
+        bbox = _bbox_from_coords(b.get("coordinates"))
+        rec = {
+            "block_type":    b.get("tag_category"),
+            "text":          b.get("content_text"),
+            "language":      td.get("lang") or td.get("language"),
+            "confidence":    b.get("confidence"),
+            "reading_order": b.get("reading_order"),
+            "bbox_norm":     bbox,
+        }
+        if bbox and page.get("width") and page.get("height"):
+            rec["bbox_px"] = [round(bbox[0] * page["width"]),  round(bbox[1] * page["height"]),
+                              round(bbox[2] * page["width"]),  round(bbox[3] * page["height"])]
+        out.append(rec)
+    return {
+        "page_name":  page["page_name"],
+        "image_path": page.get("image_path"),
+        "doc_name":   page.get("doc_name"),
+        "medium":     page.get("medium"),
+        "cls":        page.get("cls"),
+        "subject":    page.get("subject"),
+        "width":      page.get("width"),
+        "height":     page.get("height"),
+        "boxes":      out,
+    }
+
+
+def _to_coco(records: list) -> dict:
+    images, annotations, cats = [], [], {}
+    ann_id = 1
+    for img_id, r in enumerate(records, 1):
+        images.append({"id": img_id, "file_name": r["image_path"],
+                       "width": r.get("width"), "height": r.get("height")})
+        for b in r["boxes"]:
+            bt = b.get("block_type") or "unknown"
+            cats.setdefault(bt, len(cats) + 1)
+            annotations.append({
+                "id": ann_id, "image_id": img_id, "category_id": cats[bt],
+                "bbox": b.get("bbox_px") or b.get("bbox_norm"),
+                "utf8_string": b.get("text"), "language": b.get("language"),
+                "confidence": b.get("confidence"),
+            })
+            ann_id += 1
+    return {"images": images, "annotations": annotations,
+            "categories": [{"id": cid, "name": name} for name, cid in cats.items()]}
+
+
+@app.get("/export/dataset")
+def export_dataset(format: str = Query("jsonl"), _: dict = Depends(require_manager)):
+    """Export approved pages as OCR training data. format=jsonl (default) or coco.
+    Uses the canonical (lowest-tier) assignment's boxes for each page."""
+    conn = get_conn()
+    cur  = conn.cursor()
+    cur.execute("""
+        SELECT p.page_name, p.image_path, p.width, p.height,
+               d.doc_name, f.medium, f.cls, f.subject
+        FROM pages p
+        JOIN documents d ON d.id = p.doc_id
+        JOIN folders f ON f.id = d.folder_id
+        WHERE p.area = 'approved'
+        ORDER BY d.doc_name, p.page_number
+    """)
+    pages = [dict(r) for r in cur.fetchall()]
+    records = []
+    for p in pages:
+        cur.execute("SELECT id FROM assignments WHERE page_name = %s ORDER BY tier, id LIMIT 1", (p["page_name"],))
+        arow = cur.fetchone()
+        boxes = (box_db.get_boxes_for_assignment(p["page_name"], arow["id"])
+                 if arow else box_db.get_boxes(p["page_name"]))
+        records.append(_dataset_record(p, boxes))
+    cur.close(); conn.close()
+
+    if format == "coco":
+        return _to_coco(records)
+    return PlainTextResponse(
+        "\n".join(json.dumps(r, ensure_ascii=False) for r in records),
+        media_type="application/x-ndjson",
+    )

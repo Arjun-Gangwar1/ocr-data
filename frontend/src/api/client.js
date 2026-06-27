@@ -321,3 +321,8 @@ export async function maskPage(pageName, regions) {
   const { data } = await API.post(`/masker/pages/${encodeURIComponent(pageName)}/mask`, { regions });
   return data;
 }
+
+export async function exportDataset(format = 'jsonl') {
+  const { data } = await API.get(`/export/dataset?format=${encodeURIComponent(format)}`, { responseType: 'blob' });
+  return data;
+}
