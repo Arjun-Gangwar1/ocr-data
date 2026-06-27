@@ -1423,6 +1423,71 @@ def admin_gold_scores(_: dict = Depends(require_admin)):
     return rows
 
 
+# ── Analytics (B1) ────────────────────────────────────────────────────────────
+
+@app.get("/admin/analytics/annotators")
+def analytics_annotators(_: dict = Depends(require_manager)):
+    """Per-annotator productivity + quality: assignments, throughput, IAA, gold."""
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("""
+        SELECT a.annotator,
+               COUNT(*)                                              AS assignments_total,
+               COUNT(*) FILTER (WHERE a.status = 'submitted')        AS submitted,
+               COUNT(*) FILTER (WHERE a.submitted_at >= NOW() - INTERVAL '7 days') AS submitted_7d,
+               COUNT(*) FILTER (WHERE p.area = 'approved')           AS approved,
+               COUNT(*) FILTER (WHERE p.area = 'needs_adjudication') AS in_adjudication,
+               AVG(p.iaa) FILTER (WHERE p.iaa IS NOT NULL)           AS avg_iaa
+        FROM assignments a
+        JOIN pages p ON p.page_name = a.page_name
+        GROUP BY a.annotator
+    """)
+    stats = {r["annotator"]: dict(r) for r in cur.fetchall()}
+    cur.execute("""
+        SELECT annotator, COUNT(*) AS gold_pages, AVG(score) AS gold_avg, MIN(score) AS gold_min
+        FROM gold_scores GROUP BY annotator
+    """)
+    for r in cur.fetchall():
+        d = stats.setdefault(r["annotator"], {"annotator": r["annotator"]})
+        d["gold_pages"] = r["gold_pages"]; d["gold_avg"] = r["gold_avg"]; d["gold_min"] = r["gold_min"]
+    cur.close(); conn.close()
+
+    out = []
+    for d in stats.values():
+        submitted = d.get("submitted") or 0
+        d["acceptance_rate"] = ((d.get("approved") or 0) / submitted) if submitted else None
+        d["flagged"] = d.get("gold_avg") is not None and d["gold_avg"] < 0.93
+        out.append(d)
+    out.sort(key=lambda x: (x.get("gold_avg") is None, x.get("gold_avg") or 0))
+    return out
+
+
+@app.get("/admin/analytics/summary")
+def analytics_summary(_: dict = Depends(require_manager)):
+    """Project-level summary for the weekly PI dashboard (PIPELINE §12)."""
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("""
+        SELECT COUNT(*)                                            AS total_pages,
+               COUNT(*) FILTER (WHERE area = 'approved')           AS approved,
+               COUNT(*) FILTER (WHERE area = 'needs_adjudication') AS needs_adjudication,
+               COUNT(*) FILTER (WHERE area = 'pending_approval')   AS pending_approval,
+               COUNT(*) FILTER (WHERE area = 'needs_rework')       AS needs_rework,
+               COUNT(*) FILTER (WHERE assigned_to IS NOT NULL)     AS assigned,
+               COUNT(*) FILTER (WHERE is_gold)                     AS gold_pages,
+               AVG(iaa) FILTER (WHERE iaa IS NOT NULL)             AS avg_iaa
+        FROM pages
+    """)
+    s = dict(cur.fetchone())
+    cur.execute("SELECT AVG(score) AS gold_team_avg FROM gold_scores")
+    s["gold_team_avg"] = cur.fetchone()["gold_team_avg"]
+    cur.execute("SELECT COUNT(DISTINCT annotator) AS active_annotators FROM assignments")
+    s["active_annotators"] = cur.fetchone()["active_annotators"]
+    cur.close(); conn.close()
+
+    reviewed = (s["approved"] or 0) + (s["needs_adjudication"] or 0) + (s["pending_approval"] or 0)
+    s["acceptance_rate"] = ((s["approved"] or 0) / reviewed) if reviewed else None
+    return s
+
+
 # ── Manager: review queue ─────────────────────────────────────────────────────
 
 @app.get("/manager/pages")

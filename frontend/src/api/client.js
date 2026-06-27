@@ -326,3 +326,13 @@ export async function exportDataset(format = 'jsonl') {
   const { data } = await API.get(`/export/dataset?format=${encodeURIComponent(format)}`, { responseType: 'blob' });
   return data;
 }
+
+export async function getAnnotatorAnalytics() {
+  const { data } = await API.get('/admin/analytics/annotators');
+  return data;
+}
+
+export async function getAnalyticsSummary() {
+  const { data } = await API.get('/admin/analytics/summary');
+  return data;
+}
