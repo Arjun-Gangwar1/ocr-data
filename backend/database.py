@@ -132,6 +132,7 @@ def init_db():
             annotator TEXT NOT NULL,
             score     REAL NOT NULL,
             at        TIMESTAMP DEFAULT NOW(),
+            UNIQUE(page_name, annotator),
             CONSTRAINT gold_scores_page_name_fk FOREIGN KEY (page_name)
                 REFERENCES pages(page_name) ON DELETE CASCADE ON UPDATE CASCADE
         );

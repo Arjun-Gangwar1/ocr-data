@@ -1276,7 +1276,8 @@ def submit_page(page_name: str, current: dict = Depends(get_current_user)):
         if a is not None and row.get("is_gold") and row.get("gold_transcript"):
             ann_t = scoring.transcript_from_boxes(box_db.get_boxes_for_assignment(page_name, a["id"]))
             cur.execute(
-                "INSERT INTO gold_scores (page_name, annotator, score) VALUES (%s, %s, %s)",
+                "INSERT INTO gold_scores (page_name, annotator, score) VALUES (%s, %s, %s) "
+                "ON CONFLICT (page_name, annotator) DO UPDATE SET score = EXCLUDED.score, at = NOW()",
                 (page_name, current["username"], scoring.agreement(row["gold_transcript"], ann_t)),
             )
 
@@ -1382,14 +1383,21 @@ def set_gold(page_name: str, body: schemas.GoldDesignate, _: dict = Depends(requ
     if not transcript:
         raise HTTPException(400, "Provide a transcript, or an assignment_id with annotated boxes")
     conn = get_conn(); cur = conn.cursor()
-    cur.execute(
-        "UPDATE pages SET is_gold = TRUE, gold_transcript = %s WHERE page_name = %s "
-        "RETURNING page_name, is_gold",
-        (transcript, page_name),
-    )
-    updated = dict(cur.fetchone())
-    conn.commit(); cur.close(); conn.close()
-    return updated
+    try:
+        cur.execute(
+            "UPDATE pages SET is_gold = TRUE, gold_transcript = %s WHERE page_name = %s "
+            "RETURNING page_name, is_gold",
+            (transcript, page_name),
+        )
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(404, "Page not found")
+        conn.commit()
+        return dict(row)
+    except HTTPException:
+        conn.rollback(); raise
+    finally:
+        cur.close(); conn.close()
 
 
 @app.get("/admin/gold-scores")
@@ -1876,14 +1884,16 @@ def export_page(page_name: str, _: dict = Depends(get_current_user)):
 def _bbox_from_coords(coords_json):
     try:
         pts = json.loads(coords_json or "[]")
-    except (json.JSONDecodeError, TypeError):
+        if not pts:
+            return None
+        xs = [p[0] for p in pts if len(p) >= 2]
+        ys = [p[1] for p in pts if len(p) >= 2]
+        if not xs or not ys:
+            return None
+        x, y = min(xs), min(ys)
+        return [x, y, max(xs) - x, max(ys) - y]
+    except (json.JSONDecodeError, TypeError, ValueError, IndexError):
         return None
-    if not pts:
-        return None
-    xs = [p[0] for p in pts]
-    ys = [p[1] for p in pts]
-    x, y = min(xs), min(ys)
-    return [x, y, max(xs) - x, max(ys) - y]
 
 
 def _dataset_record(page: dict, boxes: list) -> dict:
@@ -1926,11 +1936,14 @@ def _to_coco(records: list) -> dict:
         images.append({"id": img_id, "file_name": r["image_path"],
                        "width": r.get("width"), "height": r.get("height")})
         for b in r["boxes"]:
+            bbox = b.get("bbox_px")
+            if bbox is None:
+                continue  # COCO needs pixel bboxes; skip boxes on pages without known dimensions
             bt = b.get("block_type") or "unknown"
             cats.setdefault(bt, len(cats) + 1)
             annotations.append({
                 "id": ann_id, "image_id": img_id, "category_id": cats[bt],
-                "bbox": b.get("bbox_px") or b.get("bbox_norm"),
+                "bbox": bbox,
                 "utf8_string": b.get("text"), "language": b.get("language"),
                 "confidence": b.get("confidence"),
             })
