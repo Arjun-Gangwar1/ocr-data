@@ -150,3 +150,19 @@ Track as one task; **security-critical — ⚠ the masker's PII guarantee is NOT
 ## Repo consolidation
 
 Make **`prabodha-ai/ocr-data`** the one platform by adopting `aperture-sud/annotation-platform`'s history. Coordinated, not unilateral: Abhiram freezes his repo (nothing unpushed) → consolidate → he archives `annotation-platform` (read-only) with a pointer to ocr-data. The `feat/qc-layer` branch (this work) lands on the consolidated repo.
+
+---
+
+## Review findings — fixed vs. open
+
+`feat/qc-layer` was reviewed by two independent agents. **Fixed in-branch:** B2 route shadowing (`/export/dataset` → `/datasets/export`), `export_page` double-blind leak (now assignment-scoped), dataset export picking the wrong tier (now `tier DESC` → adjudicated wins), annotator edits after submit (blocked), box mutation restricted to annotator/manager/admin, approval cap-of-2 made atomic (`FOR UPDATE`). **Confirmed non-issue:** bbox units are normalised fractions (traced end-to-end).
+
+**Open — need a decision (not yet actioned):**
+- **#11 `/raw` mount (CRITICAL, both reviewers).** Unauthenticated static mount; raw path == processed path → annotators can fetch un-redacted originals. Fix needs a *frontend* repoint: replace the mount with the authed `GET /pages/{name}/raw` and update `PictakerPage.jsx` / `AdminPage.jsx` (which build `RAW_BASE_URL` URLs) to fetch raw as a blob. **Do before real annotators.**
+- **Migration strategy (#1).** Abhiram's pre-existing `pages → folders/documents` migration drops columns at boot; pages with NULL `doc_name`/`medium` get orphaned (invisible via INNER JOINs, not deleted). Pre-check on a prod clone: `SELECT count(*) FROM pages WHERE doc_name IS NULL OR doc_name='' OR medium IS NULL`. Consider one-shot versioned migrations instead of schema surgery in `init_db()` on every restart.
+- **IAA metric/threshold (#6).** Page-level char agreement at ≥0.98 over-triggers adjudication on reading-order/segmentation differences. Consider per-region (bbox-IoU-matched) agreement or a lower threshold.
+- **Gold calibration (#9).** Gold pages are also capped at 2 assignments and there's no way to *target* specific gold pages to an annotator. Calibration ("every new annotator does the same 20 gold pages") needs a gold-exempt cap + a targeted gold-assignment path.
+- **Tier-3 creation** (part of #4): disagreed pages reach `needs_adjudication` but nothing assigns a tier-3 adjudicator yet (the finalize-on-tier-3-submit logic already exists). Add an assign endpoint + the side-by-side UI.
+- **Audit survival:** `box_history` cascades on page delete — decide if the audit trail should outlive page deletion (drop the cascading FK if so).
+
+**Low priority:** N+1 connections in `export_dataset` and per-box assignment lookups; analytics `acceptance_rate` is per-assignment (counts a page for both annotators). The A1 backfill is gated on an empty `assignments` table — correct for a first deploy (new table), acceptable.
