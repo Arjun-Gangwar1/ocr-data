@@ -21,7 +21,7 @@ import box_db
 import gdrive
 import schemas
 import scoring
-from auth import (create_token, get_current_user, hash_password,
+from auth import (create_token, ensure_secure_config, get_current_user, hash_password,
                   require_admin, require_manager, require_masker, verify_password)
 from database import get_conn, init_db
 
@@ -54,6 +54,7 @@ def _seed_admin():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    ensure_secure_config()
     init_db()
     _seed_admin()
     yield
@@ -285,6 +286,13 @@ _SUBJECT_ABBR = {"english": "eng", "kannada": "kan", "science": "sci",
                  "social_science": "ssc", "maths": "mat"}
 
 
+def _validate_folder_fields(medium: str, cls: str, subject: str):
+    """Allowlist medium/class/subject before they ever touch a filesystem path or
+    a Drive query (prevents path traversal / injection from raw form input)."""
+    if medium not in _MEDIUM_ABBR or cls not in _CLASS_ABBR or subject not in _SUBJECT_ABBR:
+        raise HTTPException(400, "Invalid medium, class, or subject")
+
+
 def _next_student_id(cur, folder_id: int, m: str, c: str, s: str) -> int:
     id_prefix = f"{m}_{c}_{s}_id"
     cur.execute(
@@ -392,6 +400,7 @@ async def upload_files(
 ):
     if not files:
         raise HTTPException(400, "No files provided")
+    _validate_folder_fields(medium, cls, subject)
 
     dest_dir = UPLOADS_DIR / medium / cls / subject
     dest_dir.mkdir(parents=True, exist_ok=True)
@@ -821,6 +830,7 @@ def my_assignments(current: dict = Depends(get_current_user)):
 def create_annotation_request(body: schemas.AnnotationRequestCreate, current: dict = Depends(get_current_user)):
     if current["role"] != "annotator":
         raise HTTPException(403, "Annotators only")
+    _validate_folder_fields(body.medium, body.cls, body.subject)
     conn = get_conn()
     cur  = conn.cursor()
     folder_id = _get_or_create_folder(cur, body.medium, body.cls, body.subject)
@@ -1246,11 +1256,18 @@ def withdraw_page(page_name: str, current: dict = Depends(get_current_user)):
     if row["area"] != "pending_approval":
         cur.close(); conn.close()
         raise HTTPException(400, "Page is not pending approval")
+    # Re-open the caller's assignment and clear any stale pair agreement
     cur.execute(
-        "UPDATE pages SET area = 'assigned' WHERE page_name = %s RETURNING *",
+        "UPDATE assignments SET status = 'assigned', submitted_at = NULL WHERE page_name = %s AND annotator = %s",
+        (page_name, current["username"]),
+    )
+    cur.execute(
+        "UPDATE pages SET area = 'assigned', iaa = NULL, iaa_status = NULL WHERE page_name = %s RETURNING *",
         (page_name,),
     )
     updated = dict(cur.fetchone())
+    for k in ("raw_image_path", "crop_corners"):
+        updated.pop(k, None)
     conn.commit(); cur.close(); conn.close()
     return updated
 
@@ -1273,6 +1290,8 @@ def submit_page(page_name: str, current: dict = Depends(get_current_user)):
         a = _assignment_for(cur, page_name, current["username"])
         if a is None and current["role"] not in ("manager", "admin") and row["assigned_to"] != current["username"]:
             raise HTTPException(403, "Not your page")
+        if a is not None and a["status"] == "submitted" and row["area"] != "needs_rework":
+            raise HTTPException(400, "Already submitted — withdraw to re-open, or wait for review")
 
         # Mark the caller's own assignment submitted
         if a is not None:
@@ -2057,7 +2076,7 @@ def export_dataset(format: str = Query("jsonl"), _: dict = Depends(require_manag
     pages = [dict(r) for r in cur.fetchall()]
     records = []
     for p in pages:
-        cur.execute("SELECT id FROM assignments WHERE page_name = %s ORDER BY tier DESC, id DESC LIMIT 1", (p["page_name"],))
+        cur.execute("SELECT id FROM assignments WHERE page_name = %s ORDER BY (tier = 3) DESC, tier ASC, id ASC LIMIT 1", (p["page_name"],))
         arow = cur.fetchone()
         boxes = (box_db.get_boxes_for_assignment(p["page_name"], arow["id"])
                  if arow else box_db.get_boxes(p["page_name"]))

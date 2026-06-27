@@ -14,6 +14,16 @@ pwd_context   = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/login")
 
 
+def ensure_secure_config() -> None:
+    """Fail fast if the JWT secret was never set — otherwise anyone can self-sign
+    an admin token with the known default."""
+    if SECRET_KEY == "change-me-in-production" and os.getenv("ALLOW_DEFAULT_JWT_SECRET") != "1":
+        raise RuntimeError(
+            "JWT_SECRET is not set (using the insecure default). Set JWT_SECRET, "
+            "or ALLOW_DEFAULT_JWT_SECRET=1 for local development."
+        )
+
+
 def hash_password(plain: str) -> str:
     return pwd_context.hash(plain)
 
