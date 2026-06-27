@@ -1,7 +1,22 @@
+import json
+
 from database import get_conn
 
 _FIELDS = frozenset({"parent_id", "coordinates", "tag_category", "tag_attributes",
                      "content_text", "reading_order", "confidence"})
+
+
+def _record_history(cur, action: str, box: dict, actor) -> None:
+    """Append an audit row for a box mutation, using the caller's open cursor so it
+    commits in the same transaction. `box` is the box state to snapshot."""
+    if not box:
+        return
+    cur.execute(
+        "INSERT INTO box_history (box_id, page_name, assignment_id, action, actor, snapshot) "
+        "VALUES (%s, %s, %s, %s, %s, %s)",
+        (box.get("id"), box.get("page_name"), box.get("assignment_id"),
+         action, actor, json.dumps(box, default=str)),
+    )
 
 
 def get_boxes(page_name: str) -> list:
@@ -30,7 +45,7 @@ def get_boxes_for_assignment(page_name: str, assignment_id: int) -> list:
     return [dict(r) for r in rows]
 
 
-def insert_box(page_name: str, data: dict) -> dict:
+def insert_box(page_name: str, data: dict, actor=None) -> dict:
     conn = get_conn()
     cur = conn.cursor()
     cur.execute("""
@@ -50,13 +65,14 @@ def insert_box(page_name: str, data: dict) -> dict:
         data.get("confidence"),
     ))
     row = dict(cur.fetchone())
+    _record_history(cur, "create", row, actor)
     conn.commit()
     cur.close()
     conn.close()
     return row
 
 
-def update_box(page_name: str, box_id: int, data: dict) -> dict | None:
+def update_box(page_name: str, box_id: int, data: dict, actor=None) -> dict | None:
     updates = {k: v for k, v in data.items() if k in _FIELDS}
     if not updates:
         return fetch_box(page_name, box_id)
@@ -68,6 +84,8 @@ def update_box(page_name: str, box_id: int, data: dict) -> dict | None:
         (*updates.values(), box_id, page_name),
     )
     row = cur.fetchone()
+    if row:
+        _record_history(cur, "update", dict(row), actor)
     conn.commit()
     cur.close()
     conn.close()
@@ -84,10 +102,14 @@ def fetch_box(page_name: str, box_id: int) -> dict | None:
     return dict(row) if row else None
 
 
-def remove_box(page_name: str, box_id: int):
+def remove_box(page_name: str, box_id: int, actor=None):
     conn = get_conn()
     cur = conn.cursor()
+    cur.execute("SELECT * FROM boxes WHERE id = %s AND page_name = %s", (box_id, page_name))
+    box = cur.fetchone()
     cur.execute("DELETE FROM boxes WHERE id = %s AND page_name = %s", (box_id, page_name))
+    if box:
+        _record_history(cur, "delete", dict(box), actor)
     conn.commit()
     cur.close()
     conn.close()

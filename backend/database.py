@@ -114,6 +114,18 @@ def init_db():
             CONSTRAINT assignments_page_name_fk FOREIGN KEY (page_name)
                 REFERENCES pages(page_name) ON DELETE CASCADE ON UPDATE CASCADE
         );
+        CREATE TABLE IF NOT EXISTS box_history (
+            id            SERIAL PRIMARY KEY,
+            box_id        INTEGER,
+            page_name     TEXT NOT NULL,
+            assignment_id INTEGER,
+            action        TEXT NOT NULL,
+            actor         TEXT,
+            snapshot      TEXT,
+            at            TIMESTAMP DEFAULT NOW(),
+            CONSTRAINT box_history_page_name_fk FOREIGN KEY (page_name)
+                REFERENCES pages(page_name) ON DELETE CASCADE ON UPDATE CASCADE
+        );
     """)
 
     # Add new columns to existing installs
@@ -309,6 +321,7 @@ def init_db():
     cur.execute("CREATE INDEX IF NOT EXISTS idx_assignments_page ON assignments(page_name)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_assignments_annotator ON assignments(annotator)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_boxes_assignment ON boxes(assignment_id)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_box_history_page ON box_history(page_name)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_documents_folder_id ON documents(folder_id)")
 
     # Ensure FK with ON DELETE CASCADE + ON UPDATE CASCADE for boxes

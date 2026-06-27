@@ -1180,7 +1180,7 @@ def create_box(page_name: str, box: schemas.BoxCreate, current: dict = Depends(g
         if not a:
             raise HTTPException(403, "You are not assigned to this page")
         data["assignment_id"] = a["id"]
-    return box_db.insert_box(page_name, data)
+    return box_db.insert_box(page_name, data, actor=current["username"])
 
 
 @app.put("/pages/{page_name}/boxes/{box_id}")
@@ -1188,7 +1188,7 @@ def update_box(page_name: str, box_id: int, data: schemas.BoxUpdate, current: di
     _require_editable_page(page_name, current)
     if current["role"] == "annotator":
         _require_own_box(page_name, box_id, current)
-    result = box_db.update_box(page_name, box_id, data.model_dump(exclude_unset=True))
+    result = box_db.update_box(page_name, box_id, data.model_dump(exclude_unset=True), actor=current["username"])
     if result is None:
         raise HTTPException(404, "Box not found")
     return result
@@ -1199,8 +1199,24 @@ def delete_box(page_name: str, box_id: int, current: dict = Depends(get_current_
     _require_editable_page(page_name, current)
     if current["role"] == "annotator":
         _require_own_box(page_name, box_id, current)
-    box_db.remove_box(page_name, box_id)
+    box_db.remove_box(page_name, box_id, actor=current["username"])
     return {"deleted": box_id}
+
+
+@app.get("/pages/{page_name}/history")
+def page_history(page_name: str, _: dict = Depends(require_manager)):
+    """Audit trail of box create/update/delete for a page (manager/admin)."""
+    _require_page(page_name)
+    conn = get_conn()
+    cur  = conn.cursor()
+    cur.execute("""
+        SELECT id, box_id, assignment_id, action, actor, snapshot, at
+        FROM box_history WHERE page_name = %s
+        ORDER BY at DESC, id DESC
+    """, (page_name,))
+    rows = [dict(r) for r in cur.fetchall()]
+    cur.close(); conn.close()
+    return rows
 
 
 # ── Annotator: submit page for review ────────────────────────────────────────
