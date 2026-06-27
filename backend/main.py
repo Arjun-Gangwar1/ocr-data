@@ -100,6 +100,8 @@ def _require_page(page_name: str):
 
 
 def _require_editable_page(page_name: str, current: dict):
+    if current["role"] not in ("annotator", "manager", "admin"):
+        raise HTTPException(403, "Your role cannot edit annotations")
     conn = get_conn()
     cur = conn.cursor()
     cur.execute("SELECT area FROM pages WHERE page_name = %s", (page_name,))
@@ -107,8 +109,14 @@ def _require_editable_page(page_name: str, current: dict):
     cur.close(); conn.close()
     if not row:
         raise HTTPException(404, "Page not found")
-    if dict(row)["area"] == "approved" and current["role"] != "admin":
+    area = dict(row)["area"]
+    if area == "approved" and current["role"] != "admin":
         raise HTTPException(403, "Page is approved and locked")
+    # Annotators cannot change their work once it has left annotation (post-submit),
+    # except when it is sent back for rework. (needs_adjudication stays open for the
+    # tier-3 adjudicator, who is scoped to their own assignment by _require_own_box.)
+    if current["role"] == "annotator" and area in ("pending_approval", "flagged_admin"):
+        raise HTTPException(403, "Page already submitted / under review")
 
 
 def _get_or_create_folder(cur, medium: str, cls: str, subject: str) -> int:
@@ -872,6 +880,7 @@ def approve_annotation_request(req_id: int, current: dict = Depends(get_current_
           )
         ORDER BY d.uploaded_at ASC, p.page_number ASC
         LIMIT %s
+        FOR UPDATE OF p
     """, (req["folder_id"], req["requested_by"], req["quantity"]))
     pages = [r["page_name"] for r in cur.fetchall()]
 
@@ -1919,17 +1928,22 @@ def _render_tree(box, children_map, indent):
 
 
 @app.get("/export/{page_name}", response_class=PlainTextResponse)
-def export_page(page_name: str, _: dict = Depends(get_current_user)):
+def export_page(page_name: str, current: dict = Depends(get_current_user)):
     conn = get_conn()
     cur = conn.cursor()
     cur.execute("SELECT page_number FROM pages WHERE page_name = %s", (page_name,))
     row = cur.fetchone()
+    a = _assignment_for(cur, page_name, current["username"]) if current["role"] == "annotator" else None
     cur.close(); conn.close()
     if not row:
         raise HTTPException(404, "Page not found")
 
     page_number = row["page_number"]
-    raw_boxes   = box_db.get_boxes(page_name)
+    # Annotators may export only their own assignment's boxes (double-blind)
+    if current["role"] == "annotator":
+        raw_boxes = box_db.get_boxes_for_assignment(page_name, a["id"]) if a else []
+    else:
+        raw_boxes = box_db.get_boxes(page_name)
     boxes       = [_box_ns(b) for b in raw_boxes]
     boxes_sorted = sorted(boxes, key=_sort_key)
 
@@ -2025,7 +2039,7 @@ def _to_coco(records: list) -> dict:
             "categories": [{"id": cid, "name": name} for name, cid in cats.items()]}
 
 
-@app.get("/export/dataset")
+@app.get("/datasets/export")
 def export_dataset(format: str = Query("jsonl"), _: dict = Depends(require_manager)):
     """Export approved pages as OCR training data. format=jsonl (default) or coco.
     Uses the canonical (lowest-tier) assignment's boxes for each page."""
@@ -2043,7 +2057,7 @@ def export_dataset(format: str = Query("jsonl"), _: dict = Depends(require_manag
     pages = [dict(r) for r in cur.fetchall()]
     records = []
     for p in pages:
-        cur.execute("SELECT id FROM assignments WHERE page_name = %s ORDER BY tier, id LIMIT 1", (p["page_name"],))
+        cur.execute("SELECT id FROM assignments WHERE page_name = %s ORDER BY tier DESC, id DESC LIMIT 1", (p["page_name"],))
         arow = cur.fetchone()
         boxes = (box_db.get_boxes_for_assignment(p["page_name"], arow["id"])
                  if arow else box_db.get_boxes(p["page_name"]))

@@ -323,7 +323,7 @@ export async function maskPage(pageName, regions) {
 }
 
 export async function exportDataset(format = 'jsonl') {
-  const { data } = await API.get(`/export/dataset?format=${encodeURIComponent(format)}`, { responseType: 'blob' });
+  const { data } = await API.get(`/datasets/export?format=${encodeURIComponent(format)}`, { responseType: 'blob' });
   return data;
 }
 
