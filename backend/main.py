@@ -23,7 +23,7 @@ import schemas
 import scoring
 from auth import (create_token, ensure_secure_config, get_current_user, hash_password,
                   require_admin, require_manager, require_masker, verify_password)
-from database import get_conn, init_db
+from database import db_cursor, get_conn, init_db
 
 REPO_ROOT   = Path(__file__).parent.parent
 UPLOADS_DIR = REPO_ROOT / "storage" / "uploads"
@@ -39,17 +39,13 @@ def _seed_admin():
     password = os.getenv("ADMIN_PASSWORD")
     if not username or not password:
         return
-    conn = get_conn()
-    cur  = conn.cursor()
-    cur.execute("SELECT 1 FROM users WHERE username = %s", (username,))
-    if not cur.fetchone():
-        cur.execute(
-            "INSERT INTO users (username, password_hash, role) VALUES (%s, %s, 'admin')",
-            (username, hash_password(password)),
-        )
-        conn.commit()
-    cur.close()
-    conn.close()
+    with db_cursor() as cur:
+        cur.execute("SELECT 1 FROM users WHERE username = %s", (username,))
+        if not cur.fetchone():
+            cur.execute(
+                "INSERT INTO users (username, password_hash, role) VALUES (%s, %s, 'admin')",
+                (username, hash_password(password)),
+            )
 
 
 @asynccontextmanager
@@ -71,7 +67,6 @@ app.add_middleware(
 )
 
 app.mount("/uploads", StaticFiles(directory=str(UPLOADS_DIR)), name="uploads")
-app.mount("/raw", StaticFiles(directory=str(RAW_DIR)), name="raw")
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -90,12 +85,9 @@ def _validate_name(name: str) -> str:
 
 
 def _require_page(page_name: str):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT 1 FROM pages WHERE page_name = %s", (page_name,))
-    exists = cur.fetchone() is not None
-    cur.close()
-    conn.close()
+    with db_cursor() as cur:
+        cur.execute("SELECT 1 FROM pages WHERE page_name = %s", (page_name,))
+        exists = cur.fetchone() is not None
     if not exists:
         raise HTTPException(404, "Page not found")
 
@@ -103,11 +95,9 @@ def _require_page(page_name: str):
 def _require_editable_page(page_name: str, current: dict):
     if current["role"] not in ("annotator", "manager", "admin"):
         raise HTTPException(403, "Your role cannot edit annotations")
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT area FROM pages WHERE page_name = %s", (page_name,))
-    row = cur.fetchone()
-    cur.close(); conn.close()
+    with db_cursor() as cur:
+        cur.execute("SELECT area FROM pages WHERE page_name = %s", (page_name,))
+        row = cur.fetchone()
     if not row:
         raise HTTPException(404, "Page not found")
     area = dict(row)["area"]
@@ -133,12 +123,9 @@ def _get_or_create_folder(cur, medium: str, cls: str, subject: str) -> int:
 
 @app.post("/login")
 def login(data: schemas.LoginRequest):
-    conn = get_conn()
-    cur  = conn.cursor()
-    cur.execute("SELECT password_hash, role FROM users WHERE username = %s", (data.username,))
-    row = cur.fetchone()
-    cur.close()
-    conn.close()
+    with db_cursor() as cur:
+        cur.execute("SELECT password_hash, role FROM users WHERE username = %s", (data.username,))
+        row = cur.fetchone()
     if not row or not verify_password(data.password, row["password_hash"]):
         raise HTTPException(401, "Invalid username or password")
     token = create_token(data.username, row["role"])
@@ -149,12 +136,9 @@ def login(data: schemas.LoginRequest):
 
 @app.get("/users")
 def list_users(_: dict = Depends(require_admin)):
-    conn = get_conn()
-    cur  = conn.cursor()
-    cur.execute("SELECT id, username, role, created_at FROM users ORDER BY created_at")
-    rows = [dict(r) for r in cur.fetchall()]
-    cur.close()
-    conn.close()
+    with db_cursor() as cur:
+        cur.execute("SELECT id, username, role, created_at FROM users ORDER BY created_at")
+        rows = [dict(r) for r in cur.fetchall()]
     return rows
 
 
@@ -184,13 +168,9 @@ def create_user(data: schemas.UserCreate, _: dict = Depends(require_admin)):
 def delete_user(username: str, current: dict = Depends(require_admin)):
     if username == current["username"]:
         raise HTTPException(400, "Cannot delete your own account")
-    conn = get_conn()
-    cur  = conn.cursor()
-    cur.execute("DELETE FROM users WHERE username = %s RETURNING username", (username,))
-    row = cur.fetchone()
-    conn.commit()
-    cur.close()
-    conn.close()
+    with db_cursor() as cur:
+        cur.execute("DELETE FROM users WHERE username = %s RETURNING username", (username,))
+        row = cur.fetchone()
     if not row:
         raise HTTPException(404, "User not found")
     return {"deleted": username}
@@ -437,69 +417,64 @@ async def upload_files(
 
     page_names = []
 
-    conn = get_conn()
-    cur  = conn.cursor()
-    folder_id  = _get_or_create_folder(cur, medium, cls, subject)
-    student_id = _next_student_id(cur, folder_id, m, c, s)
-    doc_name   = f"{m}_{c}_{s}_id{student_id}"
-
-    cur.execute(
-        "INSERT INTO documents (doc_name, folder_id, uploaded_by) VALUES (%s, %s, %s) RETURNING id",
-        (doc_name, folder_id, current["username"]),
-    )
-    doc_id = cur.fetchone()["id"]
-
-    for page_num, upload in enumerate(files, start=1):
-        ext = Path(upload.filename or "").suffix.lower()
-        if ext not in VALID_EXTS:
-            ext = ".jpg"
-        page_name = f"{m}_{c}_{s}_id{student_id}_{page_num}"
-        fname     = f"{page_name}{ext}"
-        file_path = dest_dir / fname
-        raw_bytes = await upload.read()
-
-        # Save original (raw) bytes untouched
-        raw_dest = RAW_DIR / medium / cls / subject
-        raw_dest.mkdir(parents=True, exist_ok=True)
-        (raw_dest / fname).write_bytes(raw_bytes)
-        raw_image_path = f"{medium}/{cls}/{subject}/{fname}"
-        gdrive.upload_async(raw_bytes, f"raw/{raw_image_path}")
-
-        page_corners = all_corners[page_num - 1] if page_num - 1 < len(all_corners) else None
-        corners_str  = json.dumps(page_corners) if page_corners is not None else None
-
-        # Apply perspective warp if corners provided, then preprocess
-        contents = raw_bytes
-        try:
-            if page_corners and len(page_corners) == 4:
-                contents = _apply_warp(raw_bytes, page_corners)
-            contents = _preprocess(contents)
-        except Exception:
-            contents = raw_bytes
-
-        width = height = None
-        try:
-            with Image.open(io.BytesIO(contents)) as img:
-                width, height = img.size
-        except Exception:
-            pass
-
-        file_path.write_bytes(contents)
-        image_path = f"{medium}/{cls}/{subject}/{fname}"
-        gdrive.upload_async(contents, f"uploads/{image_path}")
+    with db_cursor() as cur:
+        folder_id  = _get_or_create_folder(cur, medium, cls, subject)
+        student_id = _next_student_id(cur, folder_id, m, c, s)
+        doc_name   = f"{m}_{c}_{s}_id{student_id}"
 
         cur.execute(
-            """
-            INSERT INTO pages (page_name, doc_id, page_number, image_path, raw_image_path, width, height, crop_corners)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-            """,
-            (page_name, doc_id, page_num, image_path, raw_image_path, width, height, corners_str),
+            "INSERT INTO documents (doc_name, folder_id, uploaded_by) VALUES (%s, %s, %s) RETURNING id",
+            (doc_name, folder_id, current["username"]),
         )
-        page_names.append({"display_name": page_name, "page_number": page_num})
+        doc_id = cur.fetchone()["id"]
 
-    conn.commit()
-    cur.close()
-    conn.close()
+        for page_num, upload in enumerate(files, start=1):
+            ext = Path(upload.filename or "").suffix.lower()
+            if ext not in VALID_EXTS:
+                ext = ".jpg"
+            page_name = f"{m}_{c}_{s}_id{student_id}_{page_num}"
+            fname     = f"{page_name}{ext}"
+            file_path = dest_dir / fname
+            raw_bytes = await upload.read()
+
+            # Save original (raw) bytes untouched
+            raw_dest = RAW_DIR / medium / cls / subject
+            raw_dest.mkdir(parents=True, exist_ok=True)
+            (raw_dest / fname).write_bytes(raw_bytes)
+            raw_image_path = f"{medium}/{cls}/{subject}/{fname}"
+            gdrive.upload_async(raw_bytes, f"raw/{raw_image_path}")
+
+            page_corners = all_corners[page_num - 1] if page_num - 1 < len(all_corners) else None
+            corners_str  = json.dumps(page_corners) if page_corners is not None else None
+
+            # Apply perspective warp if corners provided, then preprocess
+            contents = raw_bytes
+            try:
+                if page_corners and len(page_corners) == 4:
+                    contents = _apply_warp(raw_bytes, page_corners)
+                contents = _preprocess(contents)
+            except Exception:
+                contents = raw_bytes
+
+            width = height = None
+            try:
+                with Image.open(io.BytesIO(contents)) as img:
+                    width, height = img.size
+            except Exception:
+                pass
+
+            file_path.write_bytes(contents)
+            image_path = f"{medium}/{cls}/{subject}/{fname}"
+            gdrive.upload_async(contents, f"uploads/{image_path}")
+
+            cur.execute(
+                """
+                INSERT INTO pages (page_name, doc_id, page_number, image_path, raw_image_path, width, height, crop_corners)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (page_name, doc_id, page_num, image_path, raw_image_path, width, height, corners_str),
+            )
+            page_names.append({"display_name": page_name, "page_number": page_num})
 
     return {"doc_name": doc_name, "page_names": page_names, "page_count": len(files)}
 
@@ -508,39 +483,34 @@ async def upload_files(
 
 @app.get("/folders")
 def list_folders(_: dict = Depends(get_current_user)):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT f.id, f.medium, f.cls, f.subject,
-               COUNT(DISTINCT d.id) AS doc_count,
-               COUNT(p.page_name)   AS page_count
-        FROM folders f
-        LEFT JOIN documents d ON d.folder_id = f.id
-        LEFT JOIN pages p ON p.doc_id = d.id
-        GROUP BY f.id
-        ORDER BY f.medium, f.cls, f.subject
-    """)
-    rows = [dict(r) for r in cur.fetchall()]
-    cur.close(); conn.close()
+    with db_cursor() as cur:
+        cur.execute("""
+            SELECT f.id, f.medium, f.cls, f.subject,
+                   COUNT(DISTINCT d.id) AS doc_count,
+                   COUNT(p.page_name)   AS page_count
+            FROM folders f
+            LEFT JOIN documents d ON d.folder_id = f.id
+            LEFT JOIN pages p ON p.doc_id = d.id
+            GROUP BY f.id
+            ORDER BY f.medium, f.cls, f.subject
+        """)
+        rows = [dict(r) for r in cur.fetchall()]
     return rows
 
 
 @app.get("/documents")
 def list_documents(_: dict = Depends(get_current_user)):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT d.doc_name, d.uploaded_at, d.uploaded_by,
-               f.medium, f.cls, f.subject,
-               p.page_name, p.page_number, p.area
-        FROM documents d
-        JOIN folders f ON f.id = d.folder_id
-        LEFT JOIN pages p ON p.doc_id = d.id
-        ORDER BY d.uploaded_at DESC, p.page_number ASC
-    """)
-    rows = [dict(r) for r in cur.fetchall()]
-    cur.close()
-    conn.close()
+    with db_cursor() as cur:
+        cur.execute("""
+            SELECT d.doc_name, d.uploaded_at, d.uploaded_by,
+                   f.medium, f.cls, f.subject,
+                   p.page_name, p.page_number, p.area
+            FROM documents d
+            JOIN folders f ON f.id = d.folder_id
+            LEFT JOIN pages p ON p.doc_id = d.id
+            ORDER BY d.uploaded_at DESC, p.page_number ASC
+        """)
+        rows = [dict(r) for r in cur.fetchall()]
 
     docs = {}
     for row in rows:
@@ -569,55 +539,46 @@ def list_documents(_: dict = Depends(get_current_user)):
 
 @app.patch("/documents/{doc_name}")
 def update_document(doc_name: str, data: schemas.DocumentUpdate, _: dict = Depends(get_current_user)):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT 1 FROM documents WHERE doc_name = %s", (doc_name,))
-    if not cur.fetchone():
-        cur.close(); conn.close()
-        raise HTTPException(404, "Document not found")
+    with db_cursor() as cur:
+        cur.execute("SELECT 1 FROM documents WHERE doc_name = %s", (doc_name,))
+        if not cur.fetchone():
+            raise HTTPException(404, "Document not found")
 
-    new_name = _validate_name(data.display_name) if data.display_name else doc_name
-    if new_name != doc_name:
-        cur.execute("SELECT 1 FROM documents WHERE doc_name = %s", (new_name,))
-        if cur.fetchone():
-            cur.close(); conn.close()
-            raise HTTPException(409, f"A document named '{new_name}' already exists.")
-        cur.execute("UPDATE documents SET doc_name = %s WHERE doc_name = %s", (new_name, doc_name))
-        conn.commit()
+        new_name = _validate_name(data.display_name) if data.display_name else doc_name
+        if new_name != doc_name:
+            cur.execute("SELECT 1 FROM documents WHERE doc_name = %s", (new_name,))
+            if cur.fetchone():
+                raise HTTPException(409, f"A document named '{new_name}' already exists.")
+            cur.execute("UPDATE documents SET doc_name = %s WHERE doc_name = %s", (new_name, doc_name))
 
-    cur.close(); conn.close()
     return {"display_name": new_name}
 
 
 @app.delete("/documents/{doc_name}")
 def delete_document(doc_name: str, _: dict = Depends(get_current_user)):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT p.page_name, p.image_path, p.raw_image_path
-        FROM pages p
-        JOIN documents d ON d.id = p.doc_id
-        WHERE d.doc_name = %s
-    """, (doc_name,))
-    pages = [dict(r) for r in cur.fetchall()]
-    if not pages:
-        cur.close(); conn.close()
-        raise HTTPException(404, "Document not found")
+    with db_cursor() as cur:
+        cur.execute("""
+            SELECT p.page_name, p.image_path, p.raw_image_path
+            FROM pages p
+            JOIN documents d ON d.id = p.doc_id
+            WHERE d.doc_name = %s
+        """, (doc_name,))
+        pages = [dict(r) for r in cur.fetchall()]
+        if not pages:
+            raise HTTPException(404, "Document not found")
 
-    for page in pages:
-        try:
-            (UPLOADS_DIR / page["image_path"]).unlink(missing_ok=True)
-        except Exception:
-            pass
-        try:
-            if page.get("raw_image_path"):
-                (RAW_DIR / page["raw_image_path"]).unlink(missing_ok=True)
-        except Exception:
-            pass
-    # ON DELETE CASCADE removes pages and their boxes
-    cur.execute("DELETE FROM documents WHERE doc_name = %s", (doc_name,))
-    conn.commit()
-    cur.close(); conn.close()
+        for page in pages:
+            try:
+                (UPLOADS_DIR / page["image_path"]).unlink(missing_ok=True)
+            except Exception:
+                pass
+            try:
+                if page.get("raw_image_path"):
+                    (RAW_DIR / page["raw_image_path"]).unlink(missing_ok=True)
+            except Exception:
+                pass
+        # ON DELETE CASCADE removes pages and their boxes
+        cur.execute("DELETE FROM documents WHERE doc_name = %s", (doc_name,))
     return {"deleted": doc_name}
 
 
@@ -625,18 +586,16 @@ def delete_document(doc_name: str, _: dict = Depends(get_current_user)):
 
 @app.get("/my-uploads")
 def my_uploads(current: dict = Depends(get_current_user)):
-    conn = get_conn()
-    cur  = conn.cursor()
-    cur.execute("""
-        SELECT p.*, d.doc_name, d.uploaded_by, d.uploaded_at, f.medium, f.cls, f.subject
-        FROM pages p
-        JOIN documents d ON d.id = p.doc_id
-        JOIN folders f ON f.id = d.folder_id
-        WHERE d.uploaded_by = %s
-        ORDER BY d.uploaded_at DESC, p.page_number ASC
-    """, (current["username"],))
-    rows = _strip_gold([dict(r) for r in cur.fetchall()])
-    cur.close(); conn.close()
+    with db_cursor() as cur:
+        cur.execute("""
+            SELECT p.*, d.doc_name, d.uploaded_by, d.uploaded_at, f.medium, f.cls, f.subject
+            FROM pages p
+            JOIN documents d ON d.id = p.doc_id
+            JOIN folders f ON f.id = d.folder_id
+            WHERE d.uploaded_by = %s
+            ORDER BY d.uploaded_at DESC, p.page_number ASC
+        """, (current["username"],))
+        rows = _strip_gold([dict(r) for r in cur.fetchall()])
     return rows
 
 
@@ -644,19 +603,17 @@ def my_uploads(current: dict = Depends(get_current_user)):
 
 @app.get("/admin/uploads")
 def admin_uploads(_: dict = Depends(require_admin)):
-    conn = get_conn()
-    cur  = conn.cursor()
-    cur.execute("""
-        SELECT p.page_name, d.doc_name, p.page_number, f.medium, f.cls, f.subject,
-               p.image_path, p.raw_image_path, d.uploaded_by, d.uploaded_at,
-               p.upload_approval_status, p.upload_approval_note
-        FROM pages p
-        JOIN documents d ON d.id = p.doc_id
-        JOIN folders f ON f.id = d.folder_id
-        ORDER BY d.uploaded_by, d.doc_name, p.page_number
-    """)
-    rows = [dict(r) for r in cur.fetchall()]
-    cur.close(); conn.close()
+    with db_cursor() as cur:
+        cur.execute("""
+            SELECT p.page_name, d.doc_name, p.page_number, f.medium, f.cls, f.subject,
+                   p.image_path, p.raw_image_path, d.uploaded_by, d.uploaded_at,
+                   p.upload_approval_status, p.upload_approval_note
+            FROM pages p
+            JOIN documents d ON d.id = p.doc_id
+            JOIN folders f ON f.id = d.folder_id
+            ORDER BY d.uploaded_by, d.doc_name, p.page_number
+        """)
+        rows = [dict(r) for r in cur.fetchall()]
 
     by_user = {}
     for row in rows:
@@ -673,49 +630,43 @@ def admin_uploads(_: dict = Depends(require_admin)):
 
 @app.patch("/admin/pages/{page_name}/approve-upload")
 def admin_approve_upload(page_name: str, _: dict = Depends(require_admin)):
-    conn = get_conn()
-    cur  = conn.cursor()
-    cur.execute("SELECT 1 FROM pages WHERE page_name = %s", (page_name,))
-    if not cur.fetchone():
-        cur.close(); conn.close(); raise HTTPException(404, "Page not found")
-    cur.execute("""
-        UPDATE pages SET upload_approval_status = 'approved', upload_approval_note = NULL
-        WHERE page_name = %s RETURNING page_name, upload_approval_status
-    """, (page_name,))
-    updated = dict(cur.fetchone())
-    conn.commit(); cur.close(); conn.close()
+    with db_cursor() as cur:
+        cur.execute("SELECT 1 FROM pages WHERE page_name = %s", (page_name,))
+        if not cur.fetchone():
+            raise HTTPException(404, "Page not found")
+        cur.execute("""
+            UPDATE pages SET upload_approval_status = 'approved', upload_approval_note = NULL
+            WHERE page_name = %s RETURNING page_name, upload_approval_status
+        """, (page_name,))
+        updated = dict(cur.fetchone())
     return updated
 
 
 @app.patch("/admin/pages/{page_name}/unflag-upload")
 def admin_unflag_upload(page_name: str, _: dict = Depends(require_admin)):
-    conn = get_conn()
-    cur  = conn.cursor()
-    cur.execute("SELECT 1 FROM pages WHERE page_name = %s", (page_name,))
-    if not cur.fetchone():
-        cur.close(); conn.close(); raise HTTPException(404, "Page not found")
-    cur.execute("""
-        UPDATE pages SET upload_approval_status = 'pending', upload_approval_note = NULL
-        WHERE page_name = %s RETURNING page_name, upload_approval_status
-    """, (page_name,))
-    updated = dict(cur.fetchone())
-    conn.commit(); cur.close(); conn.close()
+    with db_cursor() as cur:
+        cur.execute("SELECT 1 FROM pages WHERE page_name = %s", (page_name,))
+        if not cur.fetchone():
+            raise HTTPException(404, "Page not found")
+        cur.execute("""
+            UPDATE pages SET upload_approval_status = 'pending', upload_approval_note = NULL
+            WHERE page_name = %s RETURNING page_name, upload_approval_status
+        """, (page_name,))
+        updated = dict(cur.fetchone())
     return updated
 
 
 @app.patch("/admin/pages/{page_name}/flag-upload")
 def admin_flag_upload(page_name: str, body: schemas.UploadApprovalAction, _: dict = Depends(require_admin)):
-    conn = get_conn()
-    cur  = conn.cursor()
-    cur.execute("SELECT 1 FROM pages WHERE page_name = %s", (page_name,))
-    if not cur.fetchone():
-        cur.close(); conn.close(); raise HTTPException(404, "Page not found")
-    cur.execute("""
-        UPDATE pages SET upload_approval_status = 'flagged', upload_approval_note = %s
-        WHERE page_name = %s RETURNING page_name, upload_approval_status, upload_approval_note
-    """, (body.note, page_name))
-    updated = dict(cur.fetchone())
-    conn.commit(); cur.close(); conn.close()
+    with db_cursor() as cur:
+        cur.execute("SELECT 1 FROM pages WHERE page_name = %s", (page_name,))
+        if not cur.fetchone():
+            raise HTTPException(404, "Page not found")
+        cur.execute("""
+            UPDATE pages SET upload_approval_status = 'flagged', upload_approval_note = %s
+            WHERE page_name = %s RETURNING page_name, upload_approval_status, upload_approval_note
+        """, (body.note, page_name))
+        updated = dict(cur.fetchone())
     return updated
 
 
@@ -724,20 +675,18 @@ def admin_flag_upload(page_name: str, body: schemas.UploadApprovalAction, _: dic
 @app.get("/masker/pages")
 def masker_pages(_: dict = Depends(require_masker)):
     """Queue of upload-approved pages still awaiting identifier redaction."""
-    conn = get_conn()
-    cur  = conn.cursor()
-    cur.execute("""
-        SELECT p.page_name, p.image_path, p.width, p.height, p.mask_status,
-               d.doc_name, d.uploaded_at, f.medium, f.cls, f.subject
-        FROM pages p
-        JOIN documents d ON d.id = p.doc_id
-        JOIN folders f ON f.id = d.folder_id
-        WHERE p.upload_approval_status = 'approved' AND p.mask_status = 'pending'
-          AND p.assigned_to IS NULL
-        ORDER BY d.uploaded_at ASC, p.page_number ASC
-    """)
-    rows = [dict(r) for r in cur.fetchall()]
-    cur.close(); conn.close()
+    with db_cursor() as cur:
+        cur.execute("""
+            SELECT p.page_name, p.image_path, p.width, p.height, p.mask_status,
+                   d.doc_name, d.uploaded_at, f.medium, f.cls, f.subject
+            FROM pages p
+            JOIN documents d ON d.id = p.doc_id
+            JOIN folders f ON f.id = d.folder_id
+            WHERE p.upload_approval_status = 'approved' AND p.mask_status = 'pending'
+              AND p.assigned_to IS NULL
+            ORDER BY d.uploaded_at ASC, p.page_number ASC
+        """)
+        rows = [dict(r) for r in cur.fetchall()]
     return rows
 
 
@@ -798,50 +747,46 @@ def mask_page(page_name: str, body: schemas.MaskSubmit, current: dict = Depends(
 
 @app.get("/my-pages")
 def my_pages(current: dict = Depends(get_current_user)):
-    conn = get_conn()
-    cur  = conn.cursor()
-    cur.execute("""
-        SELECT p.*,
-               (SELECT COUNT(*) FROM boxes b
-                JOIN assignments a ON a.id = b.assignment_id
-                WHERE a.page_name = p.page_name AND a.annotator = %s) AS box_count,
-               d.doc_name, d.uploaded_at, f.medium, f.cls, f.subject
-        FROM pages p
-        JOIN documents d ON d.id = p.doc_id
-        JOIN folders f ON f.id = d.folder_id
-        WHERE p.assigned_to = %s
-        ORDER BY d.uploaded_at DESC, p.page_number ASC
-    """, (current["username"], current["username"]))
-    rows = [dict(r) for r in cur.fetchall()]
+    with db_cursor() as cur:
+        cur.execute("""
+            SELECT p.*,
+                   (SELECT COUNT(*) FROM boxes b
+                    JOIN assignments a ON a.id = b.assignment_id
+                    WHERE a.page_name = p.page_name AND a.annotator = %s) AS box_count,
+                   d.doc_name, d.uploaded_at, f.medium, f.cls, f.subject
+            FROM pages p
+            JOIN documents d ON d.id = p.doc_id
+            JOIN folders f ON f.id = d.folder_id
+            WHERE p.assigned_to = %s
+            ORDER BY d.uploaded_at DESC, p.page_number ASC
+        """, (current["username"], current["username"]))
+        rows = [dict(r) for r in cur.fetchall()]
     # Annotators never receive the raw image path or any gold-test markers
     for r in rows:
         r.pop("raw_image_path", None)
         r.pop("crop_corners", None)
         r.pop("is_gold", None)
         r.pop("gold_transcript", None)
-    cur.close(); conn.close()
     return rows
 
 
 @app.get("/my-assignments")
 def my_assignments(current: dict = Depends(get_current_user)):
     """Double-blind view: the caller's own assignments (their boxes only)."""
-    conn = get_conn()
-    cur  = conn.cursor()
-    cur.execute("""
-        SELECT a.id AS assignment_id, a.tier, a.status AS assignment_status, a.submitted_at,
-               p.page_name, p.area, p.iaa, p.iaa_status,
-               d.doc_name, f.medium, f.cls, f.subject,
-               (SELECT COUNT(*) FROM boxes b WHERE b.assignment_id = a.id) AS box_count
-        FROM assignments a
-        JOIN pages p ON p.page_name = a.page_name
-        JOIN documents d ON d.id = p.doc_id
-        JOIN folders f ON f.id = d.folder_id
-        WHERE a.annotator = %s
-        ORDER BY a.assigned_at DESC, p.page_number ASC
-    """, (current["username"],))
-    rows = [dict(r) for r in cur.fetchall()]
-    cur.close(); conn.close()
+    with db_cursor() as cur:
+        cur.execute("""
+            SELECT a.id AS assignment_id, a.tier, a.status AS assignment_status, a.submitted_at,
+                   p.page_name, p.area, p.iaa, p.iaa_status,
+                   d.doc_name, f.medium, f.cls, f.subject,
+                   (SELECT COUNT(*) FROM boxes b WHERE b.assignment_id = a.id) AS box_count
+            FROM assignments a
+            JOIN pages p ON p.page_name = a.page_name
+            JOIN documents d ON d.id = p.doc_id
+            JOIN folders f ON f.id = d.folder_id
+            WHERE a.annotator = %s
+            ORDER BY a.assigned_at DESC, p.page_number ASC
+        """, (current["username"],))
+        rows = [dict(r) for r in cur.fetchall()]
     return rows
 
 
@@ -852,31 +797,27 @@ def create_annotation_request(body: schemas.AnnotationRequestCreate, current: di
     if current["role"] != "annotator":
         raise HTTPException(403, "Annotators only")
     _validate_folder_fields(body.medium, body.cls, body.subject)
-    conn = get_conn()
-    cur  = conn.cursor()
-    folder_id = _get_or_create_folder(cur, body.medium, body.cls, body.subject)
-    cur.execute("""
-        INSERT INTO annotation_requests (requested_by, medium, cls, subject, folder_id, quantity)
-        VALUES (%s, %s, %s, %s, %s, %s) RETURNING *
-    """, (current["username"], body.medium, body.cls, body.subject, folder_id, body.quantity))
-    row = dict(cur.fetchone())
-    conn.commit(); cur.close(); conn.close()
+    with db_cursor() as cur:
+        folder_id = _get_or_create_folder(cur, body.medium, body.cls, body.subject)
+        cur.execute("""
+            INSERT INTO annotation_requests (requested_by, medium, cls, subject, folder_id, quantity)
+            VALUES (%s, %s, %s, %s, %s, %s) RETURNING *
+        """, (current["username"], body.medium, body.cls, body.subject, folder_id, body.quantity))
+        row = dict(cur.fetchone())
     return row
 
 
 @app.get("/annotation-requests")
 def list_annotation_requests(current: dict = Depends(get_current_user)):
-    conn = get_conn()
-    cur  = conn.cursor()
-    if current["role"] == "admin":
-        cur.execute("SELECT * FROM annotation_requests ORDER BY created_at DESC")
-    else:
-        cur.execute(
-            "SELECT * FROM annotation_requests WHERE requested_by = %s ORDER BY created_at DESC",
-            (current["username"],),
-        )
-    rows = [dict(r) for r in cur.fetchall()]
-    cur.close(); conn.close()
+    with db_cursor() as cur:
+        if current["role"] == "admin":
+            cur.execute("SELECT * FROM annotation_requests ORDER BY created_at DESC")
+        else:
+            cur.execute(
+                "SELECT * FROM annotation_requests WHERE requested_by = %s ORDER BY created_at DESC",
+                (current["username"],),
+            )
+        rows = [dict(r) for r in cur.fetchall()]
     return rows
 
 
@@ -884,78 +825,73 @@ def list_annotation_requests(current: dict = Depends(get_current_user)):
 def approve_annotation_request(req_id: int, current: dict = Depends(get_current_user)):
     if current["role"] != "admin":
         raise HTTPException(403, "Admin only")
-    conn = get_conn()
-    cur  = conn.cursor()
+    with db_cursor() as cur:
+        cur.execute("SELECT * FROM annotation_requests WHERE id = %s", (req_id,))
+        req = cur.fetchone()
+        if not req:
+            raise HTTPException(404, "Request not found")
+        req = dict(req)
+        if req["status"] != "pending":
+            raise HTTPException(400, "Already reviewed")
+        if not req.get("folder_id"):
+            raise HTTPException(400, "Request has no folder — re-submit the request")
 
-    cur.execute("SELECT * FROM annotation_requests WHERE id = %s", (req_id,))
-    req = cur.fetchone()
-    if not req:
-        cur.close(); conn.close(); raise HTTPException(404, "Request not found")
-    req = dict(req)
-    if req["status"] != "pending":
-        cur.close(); conn.close(); raise HTTPException(400, "Already reviewed")
-    if not req.get("folder_id"):
-        cur.close(); conn.close(); raise HTTPException(400, "Request has no folder — re-submit the request")
+        # Candidate pages: masked + upload-approved, that still need an annotator
+        # (fewer than 2 assignments) and that this annotator does not already have.
+        cur.execute("""
+            SELECT p.page_name FROM pages p
+            JOIN documents d ON d.id = p.doc_id
+            WHERE d.folder_id = %s
+              AND p.upload_approval_status = 'approved' AND p.mask_status = 'done'
+              AND (SELECT COUNT(*) FROM assignments a WHERE a.page_name = p.page_name) < %s
+              AND NOT EXISTS (
+                  SELECT 1 FROM assignments a2
+                  WHERE a2.page_name = p.page_name AND a2.annotator = %s
+              )
+            ORDER BY d.uploaded_at ASC, p.page_number ASC
+            LIMIT %s
+            FOR UPDATE OF p
+        """, (req["folder_id"], scoring.ASSIGNMENTS_PER_PAGE, req["requested_by"], req["quantity"]))
+        pages = [r["page_name"] for r in cur.fetchall()]
 
-    # Candidate pages: masked + upload-approved, that still need an annotator
-    # (fewer than 2 assignments) and that this annotator does not already have.
-    cur.execute("""
-        SELECT p.page_name FROM pages p
-        JOIN documents d ON d.id = p.doc_id
-        WHERE d.folder_id = %s
-          AND p.upload_approval_status = 'approved' AND p.mask_status = 'done'
-          AND (SELECT COUNT(*) FROM assignments a WHERE a.page_name = p.page_name) < %s
-          AND NOT EXISTS (
-              SELECT 1 FROM assignments a2
-              WHERE a2.page_name = p.page_name AND a2.annotator = %s
-          )
-        ORDER BY d.uploaded_at ASC, p.page_number ASC
-        LIMIT %s
-        FOR UPDATE OF p
-    """, (req["folder_id"], scoring.ASSIGNMENTS_PER_PAGE, req["requested_by"], req["quantity"]))
-    pages = [r["page_name"] for r in cur.fetchall()]
-
-    if not pages:
-        cur.close(); conn.close()
-        raise HTTPException(
-            400,
-            "No masked, upload-approved pages are available for this folder yet "
-            "(remaining pages may already have two annotators). Mask more pages or wait, then approve again.",
-        )
-
-    # One assignment per page: tier 1 = primary annotator, tier 2 = independent reviewer.
-    assigned = []
-    for pname in pages:
-        cur.execute("SELECT COUNT(*) AS c FROM assignments WHERE page_name = %s", (pname,))
-        c = cur.fetchone()["c"]
-        if c >= scoring.ASSIGNMENTS_PER_PAGE:
-            continue  # re-check the cap under FOR UPDATE to close the race
-        tier = c + 1
-        cur.execute(
-            "INSERT INTO assignments (page_name, annotator, tier, status) "
-            "VALUES (%s, %s, %s, 'assigned') ON CONFLICT (page_name, annotator) DO NOTHING RETURNING id",
-            (pname, req["requested_by"], tier),
-        )
-        if cur.fetchone() is None:
-            continue
-        assigned.append(pname)
-        if tier == 1:
-            cur.execute(
-                "UPDATE pages SET assigned_to = %s, area = 'assigned' WHERE page_name = %s",
-                (req["requested_by"], pname),
+        if not pages:
+            raise HTTPException(
+                400,
+                "No masked, upload-approved pages are available for this folder yet "
+                "(remaining pages may already have two annotators). Mask more pages or wait, then approve again.",
             )
 
-    if not assigned:
-        conn.rollback(); cur.close(); conn.close()
-        raise HTTPException(400, "No pages could be assigned (they may have just been taken). Try again.")
+        # One assignment per page: tier 1 = primary annotator, tier 2 = independent reviewer.
+        assigned = []
+        for pname in pages:
+            cur.execute("SELECT COUNT(*) AS c FROM assignments WHERE page_name = %s", (pname,))
+            c = cur.fetchone()["c"]
+            if c >= scoring.ASSIGNMENTS_PER_PAGE:
+                continue  # re-check the cap under FOR UPDATE to close the race
+            tier = c + 1
+            cur.execute(
+                "INSERT INTO assignments (page_name, annotator, tier, status) "
+                "VALUES (%s, %s, %s, 'assigned') ON CONFLICT (page_name, annotator) DO NOTHING RETURNING id",
+                (pname, req["requested_by"], tier),
+            )
+            if cur.fetchone() is None:
+                continue
+            assigned.append(pname)
+            if tier == 1:
+                cur.execute(
+                    "UPDATE pages SET assigned_to = %s, area = 'assigned' WHERE page_name = %s",
+                    (req["requested_by"], pname),
+                )
 
-    cur.execute("""
-        UPDATE annotation_requests
-        SET status = 'approved', reviewed_by = %s, reviewed_at = NOW(), fulfilled = %s
-        WHERE id = %s RETURNING *
-    """, (current["username"], len(assigned), req_id))
-    updated = dict(cur.fetchone())
-    conn.commit(); cur.close(); conn.close()
+        if not assigned:
+            raise HTTPException(400, "No pages could be assigned (they may have just been taken). Try again.")
+
+        cur.execute("""
+            UPDATE annotation_requests
+            SET status = 'approved', reviewed_by = %s, reviewed_at = NOW(), fulfilled = %s
+            WHERE id = %s RETURNING *
+        """, (current["username"], len(assigned), req_id))
+        updated = dict(cur.fetchone())
     return updated
 
 
@@ -963,21 +899,19 @@ def approve_annotation_request(req_id: int, current: dict = Depends(get_current_
 def reject_annotation_request(req_id: int, current: dict = Depends(get_current_user)):
     if current["role"] != "admin":
         raise HTTPException(403, "Admin only")
-    conn = get_conn()
-    cur  = conn.cursor()
-    cur.execute("SELECT status FROM annotation_requests WHERE id = %s", (req_id,))
-    row = cur.fetchone()
-    if not row:
-        cur.close(); conn.close(); raise HTTPException(404, "Request not found")
-    if dict(row)["status"] != "pending":
-        cur.close(); conn.close(); raise HTTPException(400, "Already reviewed")
-    cur.execute("""
-        UPDATE annotation_requests
-        SET status = 'rejected', reviewed_by = %s, reviewed_at = NOW()
-        WHERE id = %s RETURNING *
-    """, (current["username"], req_id))
-    updated = dict(cur.fetchone())
-    conn.commit(); cur.close(); conn.close()
+    with db_cursor() as cur:
+        cur.execute("SELECT status FROM annotation_requests WHERE id = %s", (req_id,))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(404, "Request not found")
+        if dict(row)["status"] != "pending":
+            raise HTTPException(400, "Already reviewed")
+        cur.execute("""
+            UPDATE annotation_requests
+            SET status = 'rejected', reviewed_by = %s, reviewed_at = NOW()
+            WHERE id = %s RETURNING *
+        """, (current["username"], req_id))
+        updated = dict(cur.fetchone())
     return updated
 
 
@@ -985,17 +919,15 @@ def reject_annotation_request(req_id: int, current: dict = Depends(get_current_u
 
 @app.get("/pages/{page_name}")
 def get_page(page_name: str, _: dict = Depends(get_current_user)):
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT p.*, d.doc_name, d.uploaded_at, d.uploaded_by, f.medium, f.cls, f.subject
-        FROM pages p
-        JOIN documents d ON d.id = p.doc_id
-        JOIN folders f ON f.id = d.folder_id
-        WHERE p.page_name = %s
-    """, (page_name,))
-    row = cur.fetchone()
-    cur.close(); conn.close()
+    with db_cursor() as cur:
+        cur.execute("""
+            SELECT p.*, d.doc_name, d.uploaded_at, d.uploaded_by, f.medium, f.cls, f.subject
+            FROM pages p
+            JOIN documents d ON d.id = p.doc_id
+            JOIN folders f ON f.id = d.folder_id
+            WHERE p.page_name = %s
+        """, (page_name,))
+        row = cur.fetchone()
     if not row:
         raise HTTPException(404, "Page not found")
     row = dict(row)
@@ -1014,49 +946,40 @@ def get_page(page_name: str, _: dict = Depends(get_current_user)):
 def rename_page(page_name: str, payload: schemas.PageRename, _: dict = Depends(get_current_user)):
     new_name = _validate_name(payload.display_name)
 
-    conn = get_conn()
-    cur = conn.cursor()
+    with db_cursor() as cur:
+        cur.execute("SELECT 1 FROM pages WHERE page_name = %s", (page_name,))
+        if not cur.fetchone():
+            raise HTTPException(404, "Page not found")
 
-    cur.execute("SELECT 1 FROM pages WHERE page_name = %s", (page_name,))
-    if not cur.fetchone():
-        cur.close(); conn.close()
-        raise HTTPException(404, "Page not found")
+        if new_name == page_name:
+            return {"display_name": page_name}
 
-    if new_name == page_name:
-        cur.close(); conn.close()
-        return {"display_name": page_name}
+        cur.execute("SELECT image_path FROM pages WHERE page_name = %s", (new_name,))
+        conflict = cur.fetchone()
+        if conflict:
+            if not payload.replace:
+                raise HTTPException(409, f"A page named '{new_name}' already exists.")
+            try:
+                (UPLOADS_DIR / conflict["image_path"]).unlink(missing_ok=True)
+            except Exception:
+                pass
+            cur.execute("DELETE FROM pages WHERE page_name = %s", (new_name,))
 
-    cur.execute("SELECT image_path FROM pages WHERE page_name = %s", (new_name,))
-    conflict = cur.fetchone()
-    if conflict:
-        if not payload.replace:
-            cur.close(); conn.close()
-            raise HTTPException(409, f"A page named '{new_name}' already exists.")
-        try:
-            (UPLOADS_DIR / conflict["image_path"]).unlink(missing_ok=True)
-        except Exception:
-            pass
-        cur.execute("DELETE FROM pages WHERE page_name = %s", (new_name,))
-
-    # ON UPDATE CASCADE propagates new page_name to boxes.page_name
-    cur.execute("UPDATE pages SET page_name = %s WHERE page_name = %s", (new_name, page_name))
-    conn.commit()
-    cur.close(); conn.close()
+        # ON UPDATE CASCADE propagates new page_name to boxes.page_name
+        cur.execute("UPDATE pages SET page_name = %s WHERE page_name = %s", (new_name, page_name))
     return {"display_name": new_name}
 
 
 @app.get("/pages/{page_name}/raw")
 def get_raw_image(page_name: str, current: dict = Depends(get_current_user)):
-    conn = get_conn()
-    cur  = conn.cursor()
-    cur.execute("""
-        SELECT p.raw_image_path, d.uploaded_by
-        FROM pages p
-        JOIN documents d ON d.id = p.doc_id
-        WHERE p.page_name = %s
-    """, (page_name,))
-    row = cur.fetchone()
-    cur.close(); conn.close()
+    with db_cursor() as cur:
+        cur.execute("""
+            SELECT p.raw_image_path, d.uploaded_by
+            FROM pages p
+            JOIN documents d ON d.id = p.doc_id
+            WHERE p.page_name = %s
+        """, (page_name,))
+        row = cur.fetchone()
     if not row:
         raise HTTPException(404, "Page not found")
     if current["role"] not in ("admin", "manager") and row["uploaded_by"] != current["username"]:
@@ -1072,108 +995,98 @@ def get_raw_image(page_name: str, current: dict = Depends(get_current_user)):
 
 @app.patch("/pages/{page_name}/image")
 async def replace_page_image(page_name: str, file: UploadFile = File(...), corners_json: Optional[str] = Form(None), current: dict = Depends(get_current_user)):
-    conn = get_conn()
-    cur  = conn.cursor()
-    cur.execute("""
-        SELECT p.image_path, p.raw_image_path, d.uploaded_by
-        FROM pages p
-        JOIN documents d ON d.id = p.doc_id
-        WHERE p.page_name = %s
-    """, (page_name,))
-    row = cur.fetchone()
-    if not row:
-        cur.close(); conn.close()
-        raise HTTPException(404, "Page not found")
-    if current["role"] not in ("admin", "manager") and row["uploaded_by"] != current["username"]:
-        cur.close(); conn.close()
-        raise HTTPException(403, "Not allowed")
+    with db_cursor() as cur:
+        cur.execute("""
+            SELECT p.image_path, p.raw_image_path, d.uploaded_by
+            FROM pages p
+            JOIN documents d ON d.id = p.doc_id
+            WHERE p.page_name = %s
+        """, (page_name,))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(404, "Page not found")
+        if current["role"] not in ("admin", "manager") and row["uploaded_by"] != current["username"]:
+            raise HTTPException(403, "Not allowed")
 
-    raw_bytes = await file.read()
+        raw_bytes = await file.read()
 
-    # Parse corners
-    page_corners = None
-    if corners_json:
+        # Parse corners
+        page_corners = None
+        if corners_json:
+            try:
+                page_corners = json.loads(corners_json)
+            except Exception:
+                pass
+
+        # Save original (raw) bytes untouched
+        raw_path = RAW_DIR / row["raw_image_path"] if row["raw_image_path"] else None
+        if raw_path:
+            raw_path.parent.mkdir(parents=True, exist_ok=True)
+            raw_path.write_bytes(raw_bytes)
+            gdrive.upload_async(raw_bytes, f"raw/{row['raw_image_path']}")
+
+        # Apply perspective warp if corners provided, then preprocess
+        contents = raw_bytes
         try:
-            page_corners = json.loads(corners_json)
+            if page_corners and len(page_corners) == 4:
+                contents = _apply_warp(raw_bytes, page_corners)
+            contents = _preprocess(contents)
+        except Exception:
+            contents = raw_bytes
+
+        img_path = UPLOADS_DIR / row["image_path"]
+        img_path.parent.mkdir(parents=True, exist_ok=True)
+        img_path.write_bytes(contents)
+        gdrive.upload_async(contents, f"uploads/{row['image_path']}")
+
+        width = height = None
+        try:
+            with Image.open(io.BytesIO(contents)) as img:
+                width, height = img.size
         except Exception:
             pass
 
-    # Save original (raw) bytes untouched
-    raw_path = RAW_DIR / row["raw_image_path"] if row["raw_image_path"] else None
-    if raw_path:
-        raw_path.parent.mkdir(parents=True, exist_ok=True)
-        raw_path.write_bytes(raw_bytes)
-        gdrive.upload_async(raw_bytes, f"raw/{row['raw_image_path']}")
+        cur.execute("SELECT upload_approval_status FROM pages WHERE page_name = %s", (page_name,))
+        status_row = cur.fetchone()
+        was_flagged = status_row and status_row["upload_approval_status"] == "flagged"
 
-    # Apply perspective warp if corners provided, then preprocess
-    contents = raw_bytes
-    try:
-        if page_corners and len(page_corners) == 4:
-            contents = _apply_warp(raw_bytes, page_corners)
-        contents = _preprocess(contents)
-    except Exception:
-        contents = raw_bytes
-
-    img_path = UPLOADS_DIR / row["image_path"]
-    img_path.parent.mkdir(parents=True, exist_ok=True)
-    img_path.write_bytes(contents)
-    gdrive.upload_async(contents, f"uploads/{row['image_path']}")
-
-    width = height = None
-    try:
-        with Image.open(io.BytesIO(contents)) as img:
-            width, height = img.size
-    except Exception:
-        pass
-
-    cur.execute("SELECT upload_approval_status FROM pages WHERE page_name = %s", (page_name,))
-    status_row = cur.fetchone()
-    was_flagged = status_row and status_row["upload_approval_status"] == "flagged"
-
-    cur.execute(
-        """UPDATE pages
-           SET width = %s, height = %s, crop_corners = COALESCE(%s, crop_corners),
-               mask_status = 'pending'
-               {reset}
-           WHERE page_name = %s""".format(
-            reset=", upload_approval_status = 'redo'" if was_flagged else ""
-        ),
-        (width, height, corners_json, page_name),
-    )
-    conn.commit()
-    cur.close(); conn.close()
+        cur.execute(
+            """UPDATE pages
+               SET width = %s, height = %s, crop_corners = COALESCE(%s, crop_corners),
+                   mask_status = 'pending'
+                   {reset}
+               WHERE page_name = %s""".format(
+                reset=", upload_approval_status = 'redo'" if was_flagged else ""
+            ),
+            (width, height, corners_json, page_name),
+        )
     return {"page_name": page_name, "width": width, "height": height}
 
 
 @app.delete("/pages/{page_name}")
 def delete_page(page_name: str, current: dict = Depends(get_current_user)):
-    conn = get_conn()
-    cur  = conn.cursor()
-    cur.execute("""
-        SELECT p.image_path, p.raw_image_path, d.uploaded_by
-        FROM pages p
-        JOIN documents d ON d.id = p.doc_id
-        WHERE p.page_name = %s
-    """, (page_name,))
-    row = cur.fetchone()
-    if not row:
-        cur.close(); conn.close()
-        raise HTTPException(404, "Page not found")
-    if current["role"] != "admin" and row["uploaded_by"] != current["username"]:
-        cur.close(); conn.close()
-        raise HTTPException(403, "You can only delete your own uploads")
-    try:
-        (UPLOADS_DIR / row["image_path"]).unlink(missing_ok=True)
-    except Exception:
-        pass
-    try:
-        if row["raw_image_path"]:
-            (RAW_DIR / row["raw_image_path"]).unlink(missing_ok=True)
-    except Exception:
-        pass
-    cur.execute("DELETE FROM pages WHERE page_name = %s", (page_name,))
-    conn.commit()
-    cur.close(); conn.close()
+    with db_cursor() as cur:
+        cur.execute("""
+            SELECT p.image_path, p.raw_image_path, d.uploaded_by
+            FROM pages p
+            JOIN documents d ON d.id = p.doc_id
+            WHERE p.page_name = %s
+        """, (page_name,))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(404, "Page not found")
+        if current["role"] != "admin" and row["uploaded_by"] != current["username"]:
+            raise HTTPException(403, "You can only delete your own uploads")
+        try:
+            (UPLOADS_DIR / row["image_path"]).unlink(missing_ok=True)
+        except Exception:
+            pass
+        try:
+            if row["raw_image_path"]:
+                (RAW_DIR / row["raw_image_path"]).unlink(missing_ok=True)
+        except Exception:
+            pass
+        cur.execute("DELETE FROM pages WHERE page_name = %s", (page_name,))
     return {"deleted": page_name}
 
 
@@ -1207,9 +1120,8 @@ def get_page_boxes(page_name: str, current: dict = Depends(get_current_user)):
     _require_page(page_name)
     # Annotators see only their own assignment's boxes; reviewers/admins see all.
     if current["role"] == "annotator":
-        conn = get_conn(); cur = conn.cursor()
-        a = _assignment_for(cur, page_name, current["username"])
-        cur.close(); conn.close()
+        with db_cursor() as cur:
+            a = _assignment_for(cur, page_name, current["username"])
         return box_db.get_boxes_for_assignment(page_name, a["id"]) if a else []
     return box_db.get_boxes(page_name)
 
@@ -1219,9 +1131,8 @@ def create_box(page_name: str, box: schemas.BoxCreate, current: dict = Depends(g
     _require_editable_page(page_name, current)
     data = box.model_dump()
     if current["role"] == "annotator":
-        conn = get_conn(); cur = conn.cursor()
-        a = _assignment_for(cur, page_name, current["username"])
-        cur.close(); conn.close()
+        with db_cursor() as cur:
+            a = _assignment_for(cur, page_name, current["username"])
         if not a:
             raise HTTPException(403, "You are not assigned to this page")
         if a["status"] == "submitted":
@@ -1254,15 +1165,13 @@ def delete_box(page_name: str, box_id: int, current: dict = Depends(get_current_
 def page_history(page_name: str, _: dict = Depends(require_manager)):
     """Audit trail of box create/update/delete for a page (manager/admin)."""
     _require_page(page_name)
-    conn = get_conn()
-    cur  = conn.cursor()
-    cur.execute("""
-        SELECT id, box_id, assignment_id, action, actor, snapshot, at
-        FROM box_history WHERE page_name = %s
-        ORDER BY at DESC, id DESC
-    """, (page_name,))
-    rows = [dict(r) for r in cur.fetchall()]
-    cur.close(); conn.close()
+    with db_cursor() as cur:
+        cur.execute("""
+            SELECT id, box_id, assignment_id, action, actor, snapshot, at
+            FROM box_history WHERE page_name = %s
+            ORDER BY at DESC, id DESC
+        """, (page_name,))
+        rows = [dict(r) for r in cur.fetchall()]
     return rows
 
 
@@ -1270,31 +1179,26 @@ def page_history(page_name: str, _: dict = Depends(require_manager)):
 
 @app.patch("/pages/{page_name}/withdraw")
 def withdraw_page(page_name: str, current: dict = Depends(get_current_user)):
-    conn = get_conn()
-    cur  = conn.cursor()
-    cur.execute("SELECT assigned_to, area FROM pages WHERE page_name = %s", (page_name,))
-    row = cur.fetchone()
-    if not row:
-        cur.close(); conn.close()
-        raise HTTPException(404, "Page not found")
-    row = dict(row)
-    if row["assigned_to"] != current["username"] and current["role"] not in ("manager", "admin"):
-        cur.close(); conn.close()
-        raise HTTPException(403, "Not your page")
-    if row["area"] != "pending_approval":
-        cur.close(); conn.close()
-        raise HTTPException(400, "Page is not pending approval")
-    # Re-open the caller's assignment and clear any stale pair agreement
-    cur.execute(
-        "UPDATE assignments SET status = 'assigned', submitted_at = NULL WHERE page_name = %s AND annotator = %s",
-        (page_name, current["username"]),
-    )
-    cur.execute(
-        "UPDATE pages SET area = 'assigned', iaa = NULL, iaa_status = NULL WHERE page_name = %s RETURNING *",
-        (page_name,),
-    )
-    updated = _strip_page(dict(cur.fetchone()), current["role"])
-    conn.commit(); cur.close(); conn.close()
+    with db_cursor() as cur:
+        cur.execute("SELECT assigned_to, area FROM pages WHERE page_name = %s", (page_name,))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(404, "Page not found")
+        row = dict(row)
+        if row["assigned_to"] != current["username"] and current["role"] not in ("manager", "admin"):
+            raise HTTPException(403, "Not your page")
+        if row["area"] != "pending_approval":
+            raise HTTPException(400, "Page is not pending approval")
+        # Re-open the caller's assignment and clear any stale pair agreement
+        cur.execute(
+            "UPDATE assignments SET status = 'assigned', submitted_at = NULL WHERE page_name = %s AND annotator = %s",
+            (page_name, current["username"]),
+        )
+        cur.execute(
+            "UPDATE pages SET area = 'assigned', iaa = NULL, iaa_status = NULL WHERE page_name = %s RETURNING *",
+            (page_name,),
+        )
+        updated = _strip_page(dict(cur.fetchone()), current["role"])
     return updated
 
 
@@ -1393,40 +1297,118 @@ def submit_page(page_name: str, current: dict = Depends(get_current_user)):
 
 @app.get("/pages/{page_name}/iaa")
 def page_iaa(page_name: str, _: dict = Depends(require_manager)):
-    conn = get_conn()
-    cur  = conn.cursor()
-    cur.execute("SELECT iaa, iaa_status FROM pages WHERE page_name = %s", (page_name,))
-    row = cur.fetchone()
-    if not row:
-        cur.close(); conn.close()
-        raise HTTPException(404, "Page not found")
-    cur.execute(
-        "SELECT id AS assignment_id, annotator, tier, status, submitted_at "
-        "FROM assignments WHERE page_name = %s ORDER BY tier, id",
-        (page_name,),
-    )
-    assigns = [dict(r) for r in cur.fetchall()]
-    cur.close(); conn.close()
+    with db_cursor() as cur:
+        cur.execute("SELECT iaa, iaa_status FROM pages WHERE page_name = %s", (page_name,))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(404, "Page not found")
+        cur.execute(
+            "SELECT id AS assignment_id, annotator, tier, status, submitted_at "
+            "FROM assignments WHERE page_name = %s ORDER BY tier, id",
+            (page_name,),
+        )
+        assigns = [dict(r) for r in cur.fetchall()]
     return {"page_name": page_name, **dict(row), "assignments": assigns}
 
 
 @app.get("/adjudication")
 def adjudication_queue(_: dict = Depends(require_manager)):
     """Pages where the two annotators disagreed (IAA below threshold)."""
-    conn = get_conn()
-    cur  = conn.cursor()
-    cur.execute("""
-        SELECT p.page_name, p.iaa, p.iaa_status, p.page_number,
-               d.doc_name, f.medium, f.cls, f.subject
-        FROM pages p
-        JOIN documents d ON d.id = p.doc_id
-        JOIN folders f ON f.id = d.folder_id
-        WHERE p.area = 'needs_adjudication'
-        ORDER BY p.iaa ASC NULLS FIRST, d.uploaded_at ASC
-    """)
-    rows = [dict(r) for r in cur.fetchall()]
-    cur.close(); conn.close()
+    with db_cursor() as cur:
+        cur.execute("""
+            SELECT p.page_name, p.iaa, p.iaa_status, p.page_number, p.image_path,
+                   d.doc_name, f.medium, f.cls, f.subject,
+                   a3.annotator AS adjudicator, a3.status AS adjudicator_status
+            FROM pages p
+            JOIN documents d ON d.id = p.doc_id
+            JOIN folders f ON f.id = d.folder_id
+            LEFT JOIN assignments a3 ON a3.page_name = p.page_name AND a3.tier = 3
+            WHERE p.area = 'needs_adjudication'
+            ORDER BY p.iaa ASC NULLS FIRST, d.uploaded_at ASC
+        """)
+        rows = [dict(r) for r in cur.fetchall()]
     return rows
+
+
+@app.get("/annotators")
+def list_annotators(_: dict = Depends(require_manager)):
+    """Usernames available to pick as a tier-3 adjudicator."""
+    with db_cursor() as cur:
+        cur.execute("SELECT username FROM users WHERE role = 'annotator' ORDER BY username")
+        return [r["username"] for r in cur.fetchall()]
+
+
+@app.post("/pages/{page_name}/assign-adjudicator")
+def assign_adjudicator(page_name: str, body: schemas.AssignAdjudicatorRequest, current: dict = Depends(require_manager)):
+    """Manager picks a third annotator to adjudicate a disagreed (tier-1 vs tier-2) page."""
+    with db_cursor() as cur:
+        cur.execute("SELECT area FROM pages WHERE page_name = %s", (page_name,))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(404, "Page not found")
+        if row["area"] != "needs_adjudication":
+            raise HTTPException(400, "Page is not awaiting adjudication")
+
+        cur.execute("SELECT role FROM users WHERE username = %s", (body.adjudicator,))
+        user_row = cur.fetchone()
+        if not user_row:
+            raise HTTPException(404, "Adjudicator user not found")
+        if user_row["role"] not in ("annotator", "manager", "admin"):
+            raise HTTPException(400, "Adjudicator must be an annotator, manager, or admin")
+
+        cur.execute("SELECT 1 FROM assignments WHERE page_name = %s AND tier = 3", (page_name,))
+        if cur.fetchone():
+            raise HTTPException(409, "A tier-3 adjudicator is already assigned to this page")
+
+        cur.execute(
+            "INSERT INTO assignments (page_name, annotator, tier, status) VALUES (%s, %s, 3, 'assigned') "
+            "ON CONFLICT (page_name, annotator) DO NOTHING RETURNING id",
+            (page_name, body.adjudicator),
+        )
+        inserted = cur.fetchone()
+        if inserted is None:
+            raise HTTPException(409, f"{body.adjudicator} already has an assignment on this page")
+        assignment_id = inserted["id"]
+    return {"page_name": page_name, "assignment_id": assignment_id, "adjudicator": body.adjudicator, "tier": 3}
+
+
+@app.get("/pages/{page_name}/adjudication-view")
+def adjudication_view(page_name: str, current: dict = Depends(get_current_user)):
+    """Tier-1 and tier-2 boxes side by side, for whoever is adjudicating this page."""
+    with db_cursor() as cur:
+        cur.execute("SELECT area, image_path FROM pages WHERE page_name = %s", (page_name,))
+        page_row = cur.fetchone()
+        if not page_row:
+            raise HTTPException(404, "Page not found")
+        page_row = dict(page_row)
+
+        cur.execute(
+            "SELECT id, annotator, tier, status FROM assignments WHERE page_name = %s ORDER BY tier, id",
+            (page_name,),
+        )
+        assigns = [dict(r) for r in cur.fetchall()]
+
+        my_assignment = next((a for a in assigns if a["annotator"] == current["username"]), None)
+        is_adjudicator = my_assignment is not None and my_assignment["tier"] == 3
+        if current["role"] not in ("manager", "admin") and not is_adjudicator:
+            raise HTTPException(403, "Not allowed")
+
+        tiers = []
+        for a in assigns:
+            if a["tier"] == 3:
+                continue
+            tiers.append({
+                "tier": a["tier"],
+                "annotator": a["annotator"],
+                "status": a["status"],
+                "boxes": box_db.get_boxes_for_assignment(page_name, a["id"]),
+            })
+    return {
+        "page_name": page_name,
+        "area": page_row["area"],
+        "image_path": page_row["image_path"],
+        "tiers": tiers,
+    }
 
 
 # ── Gold pages + calibration (A2) ─────────────────────────────────────────────
@@ -1464,24 +1446,100 @@ def set_gold(page_name: str, body: schemas.GoldDesignate, _: dict = Depends(requ
 @app.get("/admin/gold-scores")
 def admin_gold_scores(_: dict = Depends(require_admin)):
     """Per-annotator calibration accuracy against gold pages; flags avg below GOLD_FLAG_THRESHOLD."""
-    conn = get_conn(); cur = conn.cursor()
-    cur.execute("""
-        SELECT annotator,
-               COUNT(*)   AS pages_scored,
-               AVG(score) AS avg_score,
-               MIN(score) AS min_score,
-               MAX(at)    AS last_at
-        FROM gold_scores
-        GROUP BY annotator
-        ORDER BY avg_score ASC
-    """)
-    rows = []
-    for r in cur.fetchall():
-        d = dict(r)
-        d["flagged"] = d["avg_score"] is not None and d["avg_score"] < scoring.GOLD_FLAG_THRESHOLD
-        rows.append(d)
-    cur.close(); conn.close()
+    with db_cursor() as cur:
+        cur.execute("""
+            SELECT annotator,
+                   COUNT(*)   AS pages_scored,
+                   AVG(score) AS avg_score,
+                   MIN(score) AS min_score,
+                   MAX(at)    AS last_at
+            FROM gold_scores
+            GROUP BY annotator
+            ORDER BY avg_score ASC
+        """)
+        rows = []
+        for r in cur.fetchall():
+            d = dict(r)
+            d["flagged"] = d["avg_score"] is not None and d["avg_score"] < scoring.GOLD_FLAG_THRESHOLD
+            rows.append(d)
     return rows
+
+
+# ── Admin: full page listing + bulk-assign (C2 data manager, gold UI) ────────
+
+@app.get("/admin/pages")
+def admin_pages(_: dict = Depends(require_admin)):
+    """Every page across every folder/status, with gold + assignment detail visible —
+    the dedicated admin surface (unlike /manager/pages, which always hides gold)."""
+    with db_cursor() as cur:
+        cur.execute("""
+            SELECT p.page_name, p.page_number, p.image_path, p.area, p.assigned_to,
+                   p.mask_status, p.upload_approval_status, p.iaa, p.iaa_status,
+                   p.is_gold, p.gold_transcript,
+                   d.doc_name, d.uploaded_at, f.medium, f.cls, f.subject,
+                   (SELECT COUNT(*) FROM boxes b WHERE b.page_name = p.page_name) AS box_count
+            FROM pages p
+            JOIN documents d ON d.id = p.doc_id
+            JOIN folders f ON f.id = d.folder_id
+            ORDER BY d.uploaded_at DESC, p.page_number ASC
+        """)
+        rows = [dict(r) for r in cur.fetchall()]
+        cur.execute("SELECT id, page_name, annotator, tier, status FROM assignments ORDER BY page_name, tier")
+        by_page = {}
+        for r in cur.fetchall():
+            by_page.setdefault(r["page_name"], []).append(dict(r))
+    for row in rows:
+        row["assignments"] = by_page.get(row["page_name"], [])
+    return rows
+
+
+@app.post("/admin/pages/bulk-assign")
+def bulk_assign_pages(body: schemas.BulkAssignRequest, _: dict = Depends(require_admin)):
+    """Directly assign a chosen set of pages to one annotator, bypassing the
+    annotation-request flow. Mirrors approve_annotation_request's tier/cap logic
+    (FOR UPDATE row lock, re-check cap, ON CONFLICT DO NOTHING) per page."""
+    if not body.page_names:
+        raise HTTPException(400, "No pages selected")
+    with db_cursor() as cur:
+        cur.execute("SELECT role FROM users WHERE username = %s", (body.annotator,))
+        u = cur.fetchone()
+        if not u:
+            raise HTTPException(404, "Annotator not found")
+        if u["role"] not in ("annotator", "manager", "admin"):
+            raise HTTPException(400, "Target user is not an annotator")
+
+        assigned, skipped = [], []
+        for pname in body.page_names:
+            cur.execute(
+                "SELECT upload_approval_status, mask_status FROM pages WHERE page_name = %s FOR UPDATE",
+                (pname,),
+            )
+            row = cur.fetchone()
+            if not row:
+                skipped.append({"page_name": pname, "reason": "not found"}); continue
+            if row["upload_approval_status"] != "approved" or row["mask_status"] != "done":
+                skipped.append({"page_name": pname, "reason": "not upload-approved or not masked"}); continue
+
+            cur.execute("SELECT COUNT(*) AS c FROM assignments WHERE page_name = %s", (pname,))
+            c = cur.fetchone()["c"]
+            if c >= scoring.ASSIGNMENTS_PER_PAGE:
+                skipped.append({"page_name": pname, "reason": "already has the max assignments"}); continue
+            tier = c + 1
+
+            cur.execute(
+                "INSERT INTO assignments (page_name, annotator, tier, status) "
+                "VALUES (%s, %s, %s, 'assigned') ON CONFLICT (page_name, annotator) DO NOTHING RETURNING id",
+                (pname, body.annotator, tier),
+            )
+            if cur.fetchone() is None:
+                skipped.append({"page_name": pname, "reason": "already assigned to this annotator"}); continue
+            assigned.append(pname)
+            if tier == 1:
+                cur.execute(
+                    "UPDATE pages SET assigned_to = %s, area = 'assigned' WHERE page_name = %s",
+                    (body.annotator, pname),
+                )
+    return {"assigned": assigned, "skipped": skipped}
 
 
 # ── Analytics (B1) ────────────────────────────────────────────────────────────
@@ -1489,28 +1547,27 @@ def admin_gold_scores(_: dict = Depends(require_admin)):
 @app.get("/admin/analytics/annotators")
 def analytics_annotators(current: dict = Depends(require_manager)):
     """Per-annotator productivity + quality: assignments, throughput, IAA, gold."""
-    conn = get_conn(); cur = conn.cursor()
-    cur.execute("""
-        SELECT a.annotator,
-               COUNT(*)                                              AS assignments_total,
-               COUNT(*) FILTER (WHERE a.status = 'submitted')        AS submitted,
-               COUNT(*) FILTER (WHERE a.submitted_at >= NOW() - INTERVAL '7 days') AS submitted_7d,
-               COUNT(*) FILTER (WHERE p.area = 'approved')           AS approved,
-               COUNT(*) FILTER (WHERE p.area = 'needs_adjudication') AS in_adjudication,
-               AVG(p.iaa) FILTER (WHERE p.iaa IS NOT NULL)           AS avg_iaa
-        FROM assignments a
-        JOIN pages p ON p.page_name = a.page_name
-        GROUP BY a.annotator
-    """)
-    stats = {r["annotator"]: dict(r) for r in cur.fetchall()}
-    cur.execute("""
-        SELECT annotator, COUNT(*) AS gold_pages, AVG(score) AS gold_avg, MIN(score) AS gold_min
-        FROM gold_scores GROUP BY annotator
-    """)
-    for r in cur.fetchall():
-        d = stats.setdefault(r["annotator"], {"annotator": r["annotator"]})
-        d["gold_pages"] = r["gold_pages"]; d["gold_avg"] = r["gold_avg"]; d["gold_min"] = r["gold_min"]
-    cur.close(); conn.close()
+    with db_cursor() as cur:
+        cur.execute("""
+            SELECT a.annotator,
+                   COUNT(*)                                              AS assignments_total,
+                   COUNT(*) FILTER (WHERE a.status = 'submitted')        AS submitted,
+                   COUNT(*) FILTER (WHERE a.submitted_at >= NOW() - INTERVAL '7 days') AS submitted_7d,
+                   COUNT(*) FILTER (WHERE p.area = 'approved')           AS approved,
+                   COUNT(*) FILTER (WHERE p.area = 'needs_adjudication') AS in_adjudication,
+                   AVG(p.iaa) FILTER (WHERE p.iaa IS NOT NULL)           AS avg_iaa
+            FROM assignments a
+            JOIN pages p ON p.page_name = a.page_name
+            GROUP BY a.annotator
+        """)
+        stats = {r["annotator"]: dict(r) for r in cur.fetchall()}
+        cur.execute("""
+            SELECT annotator, COUNT(*) AS gold_pages, AVG(score) AS gold_avg, MIN(score) AS gold_min
+            FROM gold_scores GROUP BY annotator
+        """)
+        for r in cur.fetchall():
+            d = stats.setdefault(r["annotator"], {"annotator": r["annotator"]})
+            d["gold_pages"] = r["gold_pages"]; d["gold_avg"] = r["gold_avg"]; d["gold_min"] = r["gold_min"]
 
     out = []
     for d in stats.values():
@@ -1532,24 +1589,23 @@ def analytics_annotators(current: dict = Depends(require_manager)):
 @app.get("/admin/analytics/summary")
 def analytics_summary(current: dict = Depends(require_manager)):
     """Project-level summary for the weekly PI dashboard (PIPELINE §12)."""
-    conn = get_conn(); cur = conn.cursor()
-    cur.execute("""
-        SELECT COUNT(*)                                            AS total_pages,
-               COUNT(*) FILTER (WHERE area = 'approved')           AS approved,
-               COUNT(*) FILTER (WHERE area = 'needs_adjudication') AS needs_adjudication,
-               COUNT(*) FILTER (WHERE area = 'pending_approval')   AS pending_approval,
-               COUNT(*) FILTER (WHERE area = 'needs_rework')       AS needs_rework,
-               COUNT(*) FILTER (WHERE assigned_to IS NOT NULL)     AS assigned,
-               COUNT(*) FILTER (WHERE is_gold)                     AS gold_pages,
-               AVG(iaa) FILTER (WHERE iaa IS NOT NULL)             AS avg_iaa
-        FROM pages
-    """)
-    s = dict(cur.fetchone())
-    cur.execute("SELECT AVG(score) AS gold_team_avg FROM gold_scores")
-    s["gold_team_avg"] = cur.fetchone()["gold_team_avg"]
-    cur.execute("SELECT COUNT(DISTINCT annotator) AS active_annotators FROM assignments")
-    s["active_annotators"] = cur.fetchone()["active_annotators"]
-    cur.close(); conn.close()
+    with db_cursor() as cur:
+        cur.execute("""
+            SELECT COUNT(*)                                            AS total_pages,
+                   COUNT(*) FILTER (WHERE area = 'approved')           AS approved,
+                   COUNT(*) FILTER (WHERE area = 'needs_adjudication') AS needs_adjudication,
+                   COUNT(*) FILTER (WHERE area = 'pending_approval')   AS pending_approval,
+                   COUNT(*) FILTER (WHERE area = 'needs_rework')       AS needs_rework,
+                   COUNT(*) FILTER (WHERE assigned_to IS NOT NULL)     AS assigned,
+                   COUNT(*) FILTER (WHERE is_gold)                     AS gold_pages,
+                   AVG(iaa) FILTER (WHERE iaa IS NOT NULL)             AS avg_iaa
+            FROM pages
+        """)
+        s = dict(cur.fetchone())
+        cur.execute("SELECT AVG(score) AS gold_team_avg FROM gold_scores")
+        s["gold_team_avg"] = cur.fetchone()["gold_team_avg"]
+        cur.execute("SELECT COUNT(DISTINCT annotator) AS active_annotators FROM assignments")
+        s["active_annotators"] = cur.fetchone()["active_annotators"]
 
     reviewed = (s["approved"] or 0) + (s["needs_adjudication"] or 0) + (s["pending_approval"] or 0)
     s["acceptance_rate"] = ((s["approved"] or 0) / reviewed) if reviewed else None
@@ -1563,79 +1619,71 @@ def analytics_summary(current: dict = Depends(require_manager)):
 
 @app.get("/manager/pages")
 def manager_pages(current: dict = Depends(require_manager)):
-    conn = get_conn()
-    cur  = conn.cursor()
-    cur.execute("""
-        SELECT p.*, COUNT(b.id) AS box_count,
-               d.doc_name, d.uploaded_at, d.uploaded_by, f.medium, f.cls, f.subject
-        FROM pages p
-        LEFT JOIN boxes b ON b.page_name = p.page_name
-        JOIN documents d ON d.id = p.doc_id
-        JOIN folders f ON f.id = d.folder_id
-        WHERE p.assigned_to IS NOT NULL
-          AND p.area IN ('pending_approval', 'approved', 'needs_rework', 'flagged_admin')
-        GROUP BY p.page_name, d.doc_name, d.uploaded_at, d.uploaded_by, f.medium, f.cls, f.subject
-        ORDER BY d.uploaded_at DESC, p.page_number ASC
-    """)
-    rows = _strip_gold([dict(r) for r in cur.fetchall()])
-    cur.close(); conn.close()
+    with db_cursor() as cur:
+        cur.execute("""
+            SELECT p.*, COUNT(b.id) AS box_count,
+                   d.doc_name, d.uploaded_at, d.uploaded_by, f.medium, f.cls, f.subject
+            FROM pages p
+            LEFT JOIN boxes b ON b.page_name = p.page_name
+            JOIN documents d ON d.id = p.doc_id
+            JOIN folders f ON f.id = d.folder_id
+            WHERE p.assigned_to IS NOT NULL
+              AND p.area IN ('pending_approval', 'approved', 'needs_rework', 'flagged_admin')
+            GROUP BY p.page_name, d.doc_name, d.uploaded_at, d.uploaded_by, f.medium, f.cls, f.subject
+            ORDER BY d.uploaded_at DESC, p.page_number ASC
+        """)
+        rows = _strip_gold([dict(r) for r in cur.fetchall()])
     return rows
 
 
 @app.patch("/manager/pages/{page_name}/approve")
 def manager_approve(page_name: str, current: dict = Depends(require_manager)):
-    conn = get_conn()
-    cur  = conn.cursor()
-    cur.execute("SELECT 1 FROM pages WHERE page_name = %s", (page_name,))
-    if not cur.fetchone():
-        cur.close(); conn.close(); raise HTTPException(404, "Page not found")
-    cur.execute("""
-        UPDATE pages
-        SET area = 'approved', review_note = NULL, reviewed_by = %s, reviewed_at = NOW()
-        WHERE page_name = %s RETURNING *
-    """, (current["username"], page_name))
-    updated = _strip_page(dict(cur.fetchone()), current["role"])
-    conn.commit(); cur.close(); conn.close()
+    with db_cursor() as cur:
+        cur.execute("SELECT 1 FROM pages WHERE page_name = %s", (page_name,))
+        if not cur.fetchone():
+            raise HTTPException(404, "Page not found")
+        cur.execute("""
+            UPDATE pages
+            SET area = 'approved', review_note = NULL, reviewed_by = %s, reviewed_at = NOW()
+            WHERE page_name = %s RETURNING *
+        """, (current["username"], page_name))
+        updated = _strip_page(dict(cur.fetchone()), current["role"])
     return updated
 
 
 @app.patch("/manager/pages/{page_name}/send-back")
 def manager_send_back(page_name: str, body: schemas.ReviewAction, current: dict = Depends(require_manager)):
-    conn = get_conn()
-    cur  = conn.cursor()
-    cur.execute("SELECT 1 FROM pages WHERE page_name = %s", (page_name,))
-    if not cur.fetchone():
-        cur.close(); conn.close(); raise HTTPException(404, "Page not found")
-    cur.execute("""
-        UPDATE pages
-        SET area = 'needs_rework', review_note = %s, reviewed_by = %s, reviewed_at = NOW()
-        WHERE page_name = %s RETURNING *
-    """, (body.note, current["username"], page_name))
-    updated = _strip_page(dict(cur.fetchone()), current["role"])
-    # Re-open the submitted assignments so the annotator(s) can rework
-    cur.execute(
-        "UPDATE assignments SET status = 'assigned', submitted_at = NULL "
-        "WHERE page_name = %s AND status = 'submitted'",
-        (page_name,),
-    )
-    conn.commit(); cur.close(); conn.close()
+    with db_cursor() as cur:
+        cur.execute("SELECT 1 FROM pages WHERE page_name = %s", (page_name,))
+        if not cur.fetchone():
+            raise HTTPException(404, "Page not found")
+        cur.execute("""
+            UPDATE pages
+            SET area = 'needs_rework', review_note = %s, reviewed_by = %s, reviewed_at = NOW()
+            WHERE page_name = %s RETURNING *
+        """, (body.note, current["username"], page_name))
+        updated = _strip_page(dict(cur.fetchone()), current["role"])
+        # Re-open the submitted assignments so the annotator(s) can rework
+        cur.execute(
+            "UPDATE assignments SET status = 'assigned', submitted_at = NULL "
+            "WHERE page_name = %s AND status = 'submitted'",
+            (page_name,),
+        )
     return updated
 
 
 @app.patch("/manager/pages/{page_name}/flag-admin")
 def manager_flag_admin(page_name: str, body: schemas.ReviewAction, current: dict = Depends(require_manager)):
-    conn = get_conn()
-    cur  = conn.cursor()
-    cur.execute("SELECT 1 FROM pages WHERE page_name = %s", (page_name,))
-    if not cur.fetchone():
-        cur.close(); conn.close(); raise HTTPException(404, "Page not found")
-    cur.execute("""
-        UPDATE pages
-        SET area = 'flagged_admin', review_note = %s, reviewed_by = %s, reviewed_at = NOW()
-        WHERE page_name = %s RETURNING *
-    """, (body.note, current["username"], page_name))
-    updated = _strip_page(dict(cur.fetchone()), current["role"])
-    conn.commit(); cur.close(); conn.close()
+    with db_cursor() as cur:
+        cur.execute("SELECT 1 FROM pages WHERE page_name = %s", (page_name,))
+        if not cur.fetchone():
+            raise HTTPException(404, "Page not found")
+        cur.execute("""
+            UPDATE pages
+            SET area = 'flagged_admin', review_note = %s, reviewed_by = %s, reviewed_at = NOW()
+            WHERE page_name = %s RETURNING *
+        """, (body.note, current["username"], page_name))
+        updated = _strip_page(dict(cur.fetchone()), current["role"])
     return updated
 
 
@@ -1991,12 +2039,10 @@ def _render_tree(box, children_map, indent):
 def export_page(page_name: str, current: dict = Depends(get_current_user)):
     if current["role"] not in ("annotator", "manager", "admin"):
         raise HTTPException(403, "Not allowed")
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT page_number FROM pages WHERE page_name = %s", (page_name,))
-    row = cur.fetchone()
-    a = _assignment_for(cur, page_name, current["username"]) if current["role"] == "annotator" else None
-    cur.close(); conn.close()
+    with db_cursor() as cur:
+        cur.execute("SELECT page_number FROM pages WHERE page_name = %s", (page_name,))
+        row = cur.fetchone()
+        a = _assignment_for(cur, page_name, current["username"]) if current["role"] == "annotator" else None
     if not row:
         raise HTTPException(404, "Page not found")
 
@@ -2105,26 +2151,24 @@ def _to_coco(records: list) -> dict:
 def export_dataset(format: str = Query("jsonl"), _: dict = Depends(require_manager)):
     """Export approved pages as OCR training data. format=jsonl (default) or coco.
     Uses the canonical (lowest-tier) assignment's boxes for each page."""
-    conn = get_conn()
-    cur  = conn.cursor()
-    cur.execute("""
-        SELECT p.page_name, p.image_path, p.width, p.height,
-               d.doc_name, f.medium, f.cls, f.subject
-        FROM pages p
-        JOIN documents d ON d.id = p.doc_id
-        JOIN folders f ON f.id = d.folder_id
-        WHERE p.area = 'approved'
-        ORDER BY d.doc_name, p.page_number
-    """)
-    pages = [dict(r) for r in cur.fetchall()]
-    records = []
-    for p in pages:
-        cur.execute("SELECT id FROM assignments WHERE page_name = %s ORDER BY (tier = 3) DESC, tier ASC, id ASC LIMIT 1", (p["page_name"],))
-        arow = cur.fetchone()
-        boxes = (box_db.get_boxes_for_assignment(p["page_name"], arow["id"])
-                 if arow else box_db.get_boxes(p["page_name"]))
-        records.append(_dataset_record(p, boxes))
-    cur.close(); conn.close()
+    with db_cursor() as cur:
+        cur.execute("""
+            SELECT p.page_name, p.image_path, p.width, p.height,
+                   d.doc_name, f.medium, f.cls, f.subject
+            FROM pages p
+            JOIN documents d ON d.id = p.doc_id
+            JOIN folders f ON f.id = d.folder_id
+            WHERE p.area = 'approved'
+            ORDER BY d.doc_name, p.page_number
+        """)
+        pages = [dict(r) for r in cur.fetchall()]
+        records = []
+        for p in pages:
+            cur.execute("SELECT id FROM assignments WHERE page_name = %s ORDER BY (tier = 3) DESC, tier ASC, id ASC LIMIT 1", (p["page_name"],))
+            arow = cur.fetchone()
+            boxes = (box_db.get_boxes_for_assignment(p["page_name"], arow["id"])
+                     if arow else box_db.get_boxes(p["page_name"]))
+            records.append(_dataset_record(p, boxes))
 
     if format == "coco":
         return _to_coco(records)
