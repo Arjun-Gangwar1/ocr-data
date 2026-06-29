@@ -82,3 +82,14 @@ class GoldDesignate(BaseModel):
     assignment_id: Optional[int] = None
     transcript:    Optional[str] = None
     model_config = {"extra": "ignore"}
+
+
+class AssignAdjudicatorRequest(BaseModel):
+    adjudicator: str
+    model_config = {"extra": "ignore"}
+
+
+class BulkAssignRequest(BaseModel):
+    page_names: list[str]
+    annotator:  str
+    model_config = {"extra": "ignore"}
