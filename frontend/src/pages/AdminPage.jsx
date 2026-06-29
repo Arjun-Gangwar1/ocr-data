@@ -5,7 +5,9 @@ import {
   getAnnotationRequests, approveAnnotationRequest, rejectAnnotationRequest,
   getManagerPages, getAdminUploads, approveUpload, flagUpload, unflagUpload,
   approveManagerPage, sendBackPage,
-  IMAGE_BASE_URL as IMAGE_BASE, RAW_BASE_URL as RAW_BASE,
+  getAnnotatorAnalytics, getAnalyticsSummary, getGoldScores, setGold,
+  getAdminPages, bulkAssignPages, listAnnotators, getPageBoxes,
+  IMAGE_BASE_URL as IMAGE_BASE, getRawImage,
 } from '../api/client.js';
 import { useAuth } from '../context/AuthContext.jsx';
 
@@ -40,8 +42,13 @@ const TABS = [
   { id: 'uploads',     label: 'Approve Uploads' },
   { id: 'annotations', label: 'Approve Annotations' },
   { id: 'requests',    label: 'Requests' },
+  { id: 'dashboard',   label: 'Dashboard' },
+  { id: 'gold',        label: 'Gold Pages' },
+  { id: 'datamanager', label: 'Data Manager' },
   { id: 'users',       label: 'Users' },
 ];
+
+const WIDE_TABS = new Set(['dashboard', 'gold', 'datamanager']);
 
 const AREA_STYLE = {
   pending_approval: { border: '#ffcc80', bg: '#fff8e1', color: '#e65100', label: 'Pending' },
@@ -71,6 +78,7 @@ export default function AdminPage() {
   const [expandedUser,  setExpandedUser]  = useState(null);
   const [docModalName,  setDocModalName]  = useState(null);
   const [reviewModal, setReviewModal]   = useState(null);
+  const [rawImageUrl, setRawImageUrl]   = useState(null);
   const [flagNote, setFlagNote]         = useState('');
   const [actionBusy, setActionBusy]     = useState(false);
 
@@ -80,18 +88,45 @@ export default function AdminPage() {
   const [annotationNote,     setAnnotationNote]     = useState('');
   const [annotationBusy,     setAnnotationBusy]     = useState(false);
 
+  const [summary,        setSummary]        = useState(null);
+  const [annotatorStats, setAnnotatorStats] = useState([]);
+  const [goldScores,     setGoldScores]     = useState([]);
+
+  const [adminPages,   setAdminPages]   = useState([]);
+  const [annotators,   setAnnotators]   = useState([]);
+  const [goldModal,    setGoldModal]    = useState(null);
+  const [goldText,     setGoldText]     = useState('');
+  const [goldBusy,      setGoldBusy]    = useState(false);
+
+  const [dmStatus,     setDmStatus]     = useState('');
+  const [dmFolder,     setDmFolder]     = useState('');
+  const [dmAnnotator,  setDmAnnotator]  = useState('');
+  const [dmMask,       setDmMask]       = useState('');
+  const [dmSort,       setDmSort]       = useState({ key: 'uploaded_at', dir: 'desc' });
+  const [dmSelected,   setDmSelected]   = useState(new Set());
+  const [dmAssignTo,   setDmAssignTo]   = useState('');
+  const [dmBusy,        setDmBusy]      = useState(false);
+  const [dmResult,      setDmResult]    = useState(null);
+
   useEffect(() => { load(); }, []);
 
   async function load() {
     try {
-      const [u, r, mp, ug] = await Promise.all([
+      const [u, r, mp, ug, sum, astats, gscores, apages, annos] = await Promise.all([
         listUsers(), getAnnotationRequests(), getManagerPages(), getAdminUploads(),
+        getAnalyticsSummary(), getAnnotatorAnalytics(), getGoldScores(),
+        getAdminPages(), listAnnotators(),
       ]);
       setUsers(u);
       setRequests(r);
       setAnnotationPages(mp);
       setFlagged(mp.filter(p => p.area === 'flagged_admin'));
       setUploadGroups(ug);
+      setSummary(sum);
+      setAnnotatorStats(astats);
+      setGoldScores(gscores);
+      setAdminPages(apages);
+      setAnnotators(annos);
     } catch {}
   }
 
@@ -137,6 +172,19 @@ export default function AdminPage() {
     setReviewModal({ upload });
     setFlagNote(upload.upload_approval_note || '');
   }
+
+  useEffect(() => {
+    if (!reviewModal?.upload?.raw_image_path) {
+      setRawImageUrl(null);
+      return;
+    }
+    let url;
+    getRawImage(reviewModal.upload.page_name).then((blob) => {
+      url = URL.createObjectURL(blob);
+      setRawImageUrl(url);
+    }).catch(() => setRawImageUrl(null));
+    return () => { if (url) URL.revokeObjectURL(url); };
+  }, [reviewModal]);
 
   async function handleApproveUpload() {
     if (!reviewModal) return;
@@ -225,6 +273,89 @@ export default function AdminPage() {
     }
   }
 
+  function openGoldModal(page) {
+    setGoldModal(page);
+    setGoldText(page.gold_transcript || '');
+  }
+
+  async function handleDeriveTranscript(assignmentId) {
+    if (!goldModal) return;
+    try {
+      const boxes = await getPageBoxes(goldModal.page_name);
+      const mine = boxes.filter(b => b.assignment_id === assignmentId);
+      const text = mine
+        .sort((a, b) => (a.reading_order ?? 0) - (b.reading_order ?? 0))
+        .map(b => b.content_text).filter(Boolean).join(' ');
+      setGoldText(text);
+    } catch {
+      alert('Failed to load that assignment\'s boxes.');
+    }
+  }
+
+  async function handleSaveGold() {
+    if (!goldModal || !goldText.trim()) return;
+    setGoldBusy(true);
+    try {
+      await setGold(goldModal.page_name, { transcript: goldText.trim() });
+      setAdminPages(prev => prev.map(p => p.page_name === goldModal.page_name
+        ? { ...p, is_gold: true, gold_transcript: goldText.trim() } : p));
+      setGoldModal(null);
+    } catch (e) {
+      alert(e.response?.data?.detail || 'Failed to save gold page.');
+    } finally {
+      setGoldBusy(false);
+    }
+  }
+
+  function toggleSelected(pageName) {
+    setDmSelected(prev => {
+      const next = new Set(prev);
+      if (next.has(pageName)) next.delete(pageName); else next.add(pageName);
+      return next;
+    });
+  }
+
+  async function handleBulkAssign() {
+    if (!dmAssignTo || dmSelected.size === 0) return;
+    setDmBusy(true);
+    setDmResult(null);
+    try {
+      const result = await bulkAssignPages([...dmSelected], dmAssignTo);
+      setDmResult(result);
+      await load();
+      setDmSelected(new Set());
+    } catch (e) {
+      alert(e.response?.data?.detail || 'Bulk assign failed.');
+    } finally {
+      setDmBusy(false);
+    }
+  }
+
+  function toggleSort(key) {
+    setDmSort(prev => prev.key === key ? { key, dir: prev.dir === 'asc' ? 'desc' : 'asc' } : { key, dir: 'asc' });
+  }
+
+  const dmFolders = useMemo(() => {
+    const set = new Set(adminPages.map(p => `${p.medium}|${p.cls}|${p.subject}`));
+    return [...set].sort();
+  }, [adminPages]);
+
+  const dmFiltered = useMemo(() => {
+    let rows = adminPages;
+    if (dmStatus)    rows = rows.filter(p => p.area === dmStatus);
+    if (dmFolder)     rows = rows.filter(p => `${p.medium}|${p.cls}|${p.subject}` === dmFolder);
+    if (dmAnnotator) rows = rows.filter(p => p.assignments.some(a => a.annotator === dmAnnotator));
+    if (dmMask)       rows = rows.filter(p => p.mask_status === dmMask);
+    const { key, dir } = dmSort;
+    const sorted = [...rows].sort((a, b) => {
+      const av = a[key] ?? '', bv = b[key] ?? '';
+      if (av < bv) return dir === 'asc' ? -1 : 1;
+      if (av > bv) return dir === 'asc' ? 1 : -1;
+      return 0;
+    });
+    return sorted;
+  }, [adminPages, dmStatus, dmFolder, dmAnnotator, dmMask, dmSort]);
+
   const annotatorGroups = useMemo(() => {
     const map = {};
     annotationPages.forEach(p => {
@@ -302,11 +433,11 @@ export default function AdminPage() {
 
             {/* Raw vs processed images */}
             <div style={{ display: 'flex', gap: '12px', flexWrap: 'wrap' }}>
-              {reviewModal.upload.raw_image_path && (
+              {reviewModal.upload.raw_image_path && rawImageUrl && (
                 <div style={{ flex: 1, minWidth: '200px' }}>
                   <div style={{ fontSize: '11px', color: '#888', fontWeight: 600, marginBottom: '6px', textTransform: 'uppercase', letterSpacing: '0.06em' }}>Raw</div>
                   <img
-                    src={`${RAW_BASE}/${reviewModal.upload.raw_image_path}`}
+                    src={rawImageUrl}
                     alt="raw"
                     style={{ width: '100%', borderRadius: '8px', border: '1px solid #e0e0e0', display: 'block' }}
                     onError={(e) => { e.target.style.display = 'none'; }}
@@ -503,7 +634,7 @@ export default function AdminPage() {
         </div>
       )}
 
-      <div style={{ padding: '28px', maxWidth: '760px', margin: '0 auto' }}>
+      <div style={{ padding: '28px', maxWidth: WIDE_TABS.has(activeTab) ? '1180px' : '760px', margin: '0 auto' }}>
 
         {/* Header */}
         <div style={{ display: 'flex', alignItems: 'center', marginBottom: '20px', paddingBottom: '16px', borderBottom: '1px solid #e4e4e4' }}>
@@ -807,6 +938,290 @@ export default function AdminPage() {
           </div>
         )}
 
+        {/* ── Dashboard tab (B1) ── */}
+        {activeTab === 'dashboard' && (
+          <div>
+            <div style={S.card}>
+              <h2 style={S.cardTitle}>Project summary</h2>
+              {!summary ? <p style={{ color: '#bbb', fontSize: '13px' }}>Loading…</p> : (
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(130px, 1fr))', gap: '10px' }}>
+                  <Stat label="Total pages" value={summary.total_pages} />
+                  <Stat label="Approved" value={summary.approved} color="#2e7d32" />
+                  <Stat label="Pending approval" value={summary.pending_approval} color="#e65100" />
+                  <Stat label="Needs rework" value={summary.needs_rework} color="#b71c1c" />
+                  <Stat label="Needs adjudication" value={summary.needs_adjudication} color="#6a1b9a" />
+                  <Stat label="Assigned" value={summary.assigned} />
+                  <Stat label="Active annotators" value={summary.active_annotators} />
+                  <Stat label="Avg IAA" value={fmtPct(summary.avg_iaa)} />
+                  <Stat label="Acceptance rate" value={fmtPct(summary.acceptance_rate)} />
+                  {summary.gold_pages != null && <Stat label="Gold pages" value={summary.gold_pages} color="#6a1b9a" />}
+                  {summary.gold_team_avg != null && <Stat label="Gold team avg" value={fmtPct(summary.gold_team_avg)} color="#6a1b9a" />}
+                </div>
+              )}
+            </div>
+
+            <div style={S.card}>
+              <h2 style={S.cardTitle}>Per-annotator</h2>
+              {annotatorStats.length === 0 ? (
+                <p style={{ color: '#bbb', fontSize: '13px' }}>No annotator activity yet.</p>
+              ) : (
+                <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '13px' }}>
+                  <thead>
+                    <tr style={{ borderBottom: '1px solid #eee' }}>
+                      {['Annotator', 'Assignments', 'Submitted', 'Last 7d', 'Approved', 'In adjudication', 'Avg IAA', 'Acceptance', 'Gold pages', 'Gold avg', ''].map(h => (
+                        <th key={h} style={{ textAlign: 'left', padding: '6px 10px', color: '#888', fontWeight: 600, fontSize: '11px' }}>{h}</th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {annotatorStats.map(a => (
+                      <tr key={a.annotator} style={{ borderBottom: '1px solid #f5f5f5' }}>
+                        <td style={{ padding: '9px 10px', fontWeight: 600 }}>{a.annotator}</td>
+                        <td style={{ padding: '9px 10px' }}>{a.assignments_total}</td>
+                        <td style={{ padding: '9px 10px' }}>{a.submitted}</td>
+                        <td style={{ padding: '9px 10px' }}>{a.submitted_7d}</td>
+                        <td style={{ padding: '9px 10px' }}>{a.approved}</td>
+                        <td style={{ padding: '9px 10px' }}>{a.in_adjudication}</td>
+                        <td style={{ padding: '9px 10px' }}>{fmtPct(a.avg_iaa)}</td>
+                        <td style={{ padding: '9px 10px' }}>{fmtPct(a.acceptance_rate)}</td>
+                        <td style={{ padding: '9px 10px', color: a.gold_pages != null ? '#333' : '#ccc' }}>{a.gold_pages ?? '—'}</td>
+                        <td style={{ padding: '9px 10px', color: a.gold_avg != null ? '#333' : '#ccc' }}>{a.gold_avg != null ? fmtPct(a.gold_avg) : '—'}</td>
+                        <td style={{ padding: '9px 10px' }}>
+                          {a.flagged && (
+                            <span style={{ fontSize: '11px', padding: '2px 8px', borderRadius: '10px', fontWeight: 600, backgroundColor: '#fce4ec', color: '#b71c1c' }}>flagged</span>
+                          )}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* ── Gold Pages tab ── */}
+        {activeTab === 'gold' && (
+          <div>
+            {goldModal && (
+              <div
+                style={{ position: 'fixed', inset: 0, backgroundColor: 'rgba(0,0,0,0.72)', zIndex: 1010, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '16px' }}
+                onClick={() => !goldBusy && setGoldModal(null)}
+              >
+                <div
+                  style={{ backgroundColor: '#fff', borderRadius: '14px', padding: '20px', width: '100%', maxWidth: '620px', display: 'flex', flexDirection: 'column', gap: '14px', maxHeight: '88vh', overflowY: 'auto' }}
+                  onClick={e => e.stopPropagation()}
+                >
+                  <div>
+                    <div style={{ fontSize: '15px', fontWeight: 700, color: '#1a1a1a' }}>{goldModal.page_name}</div>
+                    <div style={{ fontSize: '12px', color: '#888', marginTop: '2px' }}>
+                      {MEDIUM_LABEL[goldModal.medium] || goldModal.medium} · {CLASS_LABEL[goldModal.cls] || goldModal.cls} · {SUBJECT_LABEL[goldModal.subject] || goldModal.subject}
+                      {goldModal.is_gold && <span style={{ marginLeft: '8px', color: '#6a1b9a', fontWeight: 600 }}>already gold</span>}
+                    </div>
+                  </div>
+
+                  <img
+                    src={`${IMAGE_BASE}/${goldModal.image_path}`}
+                    alt={goldModal.page_name}
+                    style={{ width: '100%', borderRadius: '8px', border: '1px solid #e0e0e0', display: 'block' }}
+                    onError={e => { e.target.style.display = 'none'; }}
+                  />
+
+                  {goldModal.assignments.length > 0 && (
+                    <div>
+                      <div style={{ fontSize: '12px', color: '#666', marginBottom: '6px' }}>Derive transcript from an existing assignment:</div>
+                      <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap' }}>
+                        {goldModal.assignments.map(a => (
+                          <button key={a.id} onClick={() => handleDeriveTranscript(a.id)} style={S.deriveBtn}>
+                            Tier {a.tier} · {a.annotator} ({a.status})
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  <div>
+                    <label style={{ fontSize: '12px', color: '#666', display: 'block', marginBottom: '4px' }}>Ground-truth transcript</label>
+                    <textarea
+                      value={goldText}
+                      onChange={e => setGoldText(e.target.value)}
+                      placeholder="Type, or derive from an assignment above"
+                      style={{ width: '100%', padding: '8px 10px', fontSize: '13px', border: '1px solid #ddd', borderRadius: '6px', boxSizing: 'border-box', resize: 'vertical', minHeight: '90px', fontFamily: 'inherit' }}
+                    />
+                  </div>
+
+                  <div style={{ display: 'flex', gap: '8px', justifyContent: 'flex-end' }}>
+                    <button onClick={() => setGoldModal(null)} disabled={goldBusy} style={{ padding: '8px 14px', border: '1px solid #ddd', borderRadius: '6px', background: 'none', color: '#555', cursor: 'pointer', fontSize: '13px' }}>
+                      Cancel
+                    </button>
+                    <button onClick={handleSaveGold} disabled={goldBusy || !goldText.trim()} style={{ padding: '8px 14px', border: 'none', borderRadius: '6px', backgroundColor: '#6a1b9a', color: '#fff', cursor: 'pointer', fontSize: '13px', fontWeight: 600, opacity: !goldText.trim() ? 0.5 : 1 }}>
+                      {goldBusy ? '…' : goldModal.is_gold ? 'Update gold transcript' : 'Mark as gold'}
+                    </button>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {goldScores.length > 0 && (
+              <div style={S.card}>
+                <h2 style={S.cardTitle}>Calibration scores</h2>
+                <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '13px' }}>
+                  <thead>
+                    <tr style={{ borderBottom: '1px solid #eee' }}>
+                      {['Annotator', 'Pages scored', 'Avg score', 'Min score', 'Last scored', ''].map(h => (
+                        <th key={h} style={{ textAlign: 'left', padding: '6px 10px', color: '#888', fontWeight: 600, fontSize: '11px' }}>{h}</th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {goldScores.map(g => (
+                      <tr key={g.annotator} style={{ borderBottom: '1px solid #f5f5f5' }}>
+                        <td style={{ padding: '9px 10px', fontWeight: 600 }}>{g.annotator}</td>
+                        <td style={{ padding: '9px 10px' }}>{g.pages_scored}</td>
+                        <td style={{ padding: '9px 10px' }}>{fmtPct(g.avg_score)}</td>
+                        <td style={{ padding: '9px 10px' }}>{fmtPct(g.min_score)}</td>
+                        <td style={{ padding: '9px 10px', color: '#aaa' }}>{new Date(g.last_at).toLocaleDateString()}</td>
+                        <td style={{ padding: '9px 10px' }}>
+                          {g.flagged && <span style={{ fontSize: '11px', padding: '2px 8px', borderRadius: '10px', fontWeight: 600, backgroundColor: '#fce4ec', color: '#b71c1c' }}>flagged</span>}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+
+            <div style={S.card}>
+              <h2 style={S.cardTitle}>
+                All pages
+                <span style={{ fontSize: '12px', fontWeight: 600, backgroundColor: '#f3e5f5', color: '#6a1b9a', padding: '1px 8px', borderRadius: '10px' }}>
+                  {adminPages.filter(p => p.is_gold).length} gold
+                </span>
+              </h2>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(96px, 1fr))', gap: '8px' }}>
+                {adminPages.map(p => (
+                  <div
+                    key={p.page_name}
+                    style={{ cursor: 'pointer', borderRadius: '8px', overflow: 'hidden', border: `2px solid ${p.is_gold ? '#ce93d8' : '#e8e8e8'}`, backgroundColor: '#fff' }}
+                    onClick={() => openGoldModal(p)}
+                  >
+                    <img src={`${IMAGE_BASE}/${p.image_path}`} alt={p.page_name}
+                      style={{ width: '100%', height: '100px', objectFit: 'cover', display: 'block' }}
+                      onError={e => { e.target.style.display = 'none'; }} />
+                    <div style={{ padding: '4px 6px 6px' }}>
+                      <div style={{ fontSize: '10px', color: '#555', wordBreak: 'break-all', lineHeight: '1.3' }}>{p.page_name}</div>
+                      {p.is_gold && (
+                        <span style={{ fontSize: '9px', padding: '1px 5px', borderRadius: '8px', fontWeight: 600, display: 'inline-block', marginTop: '3px', backgroundColor: '#f3e5f5', color: '#6a1b9a' }}>
+                          gold
+                        </span>
+                      )}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* ── Data Manager tab (C2) ── */}
+        {activeTab === 'datamanager' && (
+          <div>
+            <div style={S.card}>
+              <h2 style={S.cardTitle}>Filters</h2>
+              <div style={{ display: 'flex', gap: '10px', flexWrap: 'wrap' }}>
+                <select value={dmStatus} onChange={e => setDmStatus(e.target.value)} style={S.input}>
+                  <option value="">Any status</option>
+                  {['assigned', 'pending_approval', 'needs_rework', 'needs_adjudication', 'flagged_admin', 'approved'].map(s => (
+                    <option key={s} value={s}>{s}</option>
+                  ))}
+                </select>
+                <select value={dmFolder} onChange={e => setDmFolder(e.target.value)} style={S.input}>
+                  <option value="">Any folder</option>
+                  {dmFolders.map(f => {
+                    const [m, c, s] = f.split('|');
+                    return <option key={f} value={f}>{MEDIUM_LABEL[m] || m} · {CLASS_LABEL[c] || c} · {SUBJECT_LABEL[s] || s}</option>;
+                  })}
+                </select>
+                <select value={dmAnnotator} onChange={e => setDmAnnotator(e.target.value)} style={S.input}>
+                  <option value="">Any annotator</option>
+                  {annotators.map(a => <option key={a} value={a}>{a}</option>)}
+                </select>
+                <select value={dmMask} onChange={e => setDmMask(e.target.value)} style={S.input}>
+                  <option value="">Any mask state</option>
+                  <option value="pending">Mask pending</option>
+                  <option value="done">Mask done</option>
+                </select>
+              </div>
+            </div>
+
+            <div style={S.card}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '12px', flexWrap: 'wrap' }}>
+                <h2 style={{ ...S.cardTitle, margin: 0 }}>
+                  {dmFiltered.length} page{dmFiltered.length !== 1 ? 's' : ''}
+                </h2>
+                {dmSelected.size > 0 && (
+                  <>
+                    <span style={{ fontSize: '12px', color: '#888' }}>{dmSelected.size} selected</span>
+                    <select value={dmAssignTo} onChange={e => setDmAssignTo(e.target.value)} style={{ ...S.input, width: 'auto' }}>
+                      <option value="">Assign to…</option>
+                      {annotators.map(a => <option key={a} value={a}>{a}</option>)}
+                    </select>
+                    <button onClick={handleBulkAssign} disabled={!dmAssignTo || dmBusy} style={{ ...S.approveBtn, opacity: !dmAssignTo ? 0.5 : 1 }}>
+                      {dmBusy ? '…' : 'Bulk assign'}
+                    </button>
+                  </>
+                )}
+              </div>
+
+              {dmResult && (
+                <div style={{ fontSize: '12px', color: '#555', backgroundColor: '#f5f5f5', borderRadius: '6px', padding: '8px 12px', marginBottom: '10px' }}>
+                  Assigned {dmResult.assigned.length}.
+                  {dmResult.skipped.length > 0 && ` Skipped ${dmResult.skipped.length}: ${dmResult.skipped.map(s => `${s.page_name} (${s.reason})`).join(', ')}`}
+                </div>
+              )}
+
+              <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '13px' }}>
+                <thead>
+                  <tr style={{ borderBottom: '1px solid #eee' }}>
+                    <th style={{ padding: '6px 10px' }}>
+                      <input type="checkbox"
+                        checked={dmSelected.size > 0 && dmSelected.size === dmFiltered.length}
+                        onChange={e => setDmSelected(e.target.checked ? new Set(dmFiltered.map(p => p.page_name)) : new Set())}
+                      />
+                    </th>
+                    {[['page_name', 'Page'], ['area', 'Status'], ['mask_status', 'Mask'], ['iaa', 'IAA'], ['box_count', 'Boxes'], ['uploaded_at', 'Uploaded']].map(([key, label]) => (
+                      <th key={key} onClick={() => toggleSort(key)} style={{ textAlign: 'left', padding: '6px 10px', color: '#888', fontWeight: 600, fontSize: '11px', cursor: 'pointer' }}>
+                        {label}{dmSort.key === key ? (dmSort.dir === 'asc' ? ' ▲' : ' ▼') : ''}
+                      </th>
+                    ))}
+                    <th style={{ padding: '6px 10px' }}>Annotators</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {dmFiltered.map(p => (
+                    <tr key={p.page_name} style={{ borderBottom: '1px solid #f5f5f5', backgroundColor: dmSelected.has(p.page_name) ? '#f5f9ff' : 'transparent' }}>
+                      <td style={{ padding: '9px 10px' }}>
+                        <input type="checkbox" checked={dmSelected.has(p.page_name)} onChange={() => toggleSelected(p.page_name)} />
+                      </td>
+                      <td style={{ padding: '9px 10px', fontWeight: 600, maxWidth: '160px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={p.page_name}>
+                        {p.page_name}
+                      </td>
+                      <td style={{ padding: '9px 10px' }}>{p.area}</td>
+                      <td style={{ padding: '9px 10px' }}>{p.mask_status}</td>
+                      <td style={{ padding: '9px 10px' }}>{p.iaa != null ? fmtPct(p.iaa) : '—'}</td>
+                      <td style={{ padding: '9px 10px' }}>{p.box_count}</td>
+                      <td style={{ padding: '9px 10px', color: '#aaa', whiteSpace: 'nowrap' }}>{new Date(p.uploaded_at).toLocaleDateString()}</td>
+                      <td style={{ padding: '9px 10px', fontSize: '12px', color: '#666' }}>
+                        {p.assignments.map(a => `${a.annotator}(t${a.tier})`).join(', ') || '—'}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )}
+
         {/* ── Users tab ── */}
         {activeTab === 'users' && (
           <div>
@@ -886,6 +1301,19 @@ export default function AdminPage() {
   );
 }
 
+function fmtPct(v) {
+  return v == null ? '—' : `${Math.round(v * 100)}%`;
+}
+
+function Stat({ label, value, color }) {
+  return (
+    <div style={{ border: '1px solid #eee', borderRadius: '8px', padding: '10px 12px', backgroundColor: '#fafafa' }}>
+      <div style={{ fontSize: '20px', fontWeight: 700, color: color || '#1a1a1a' }}>{value ?? '—'}</div>
+      <div style={{ fontSize: '11px', color: '#888', marginTop: '2px' }}>{label}</div>
+    </div>
+  );
+}
+
 const S = {
   back: {
     background: 'none', border: '1px solid #ddd', borderRadius: '6px',
@@ -918,6 +1346,10 @@ const S = {
   approveBtn: {
     background: 'none', border: '1px solid #a5d6a7', color: '#2e7d32',
     borderRadius: '4px', padding: '3px 10px', cursor: 'pointer', fontSize: '12px',
+  },
+  deriveBtn: {
+    padding: '4px 10px', backgroundColor: '#fff', border: '1px solid #ce93d8', color: '#6a1b9a',
+    borderRadius: '5px', cursor: 'pointer', fontSize: '12px', fontWeight: 600,
   },
   tag: {
     fontSize: '11px', backgroundColor: '#f0f0f0', color: '#555',
