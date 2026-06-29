@@ -11,8 +11,23 @@ import TagDropdown from '../components/TagDropdown.jsx';
 import TagForm from '../components/TagForm.jsx';
 import FormulaKeyboard from '../components/FormulaKeyboard.jsx';
 import Renderer from '../components/Renderer.jsx';
+import { HOTKEY_TAGS } from '../tags/tagSchemas.js';
 
 const PANEL_WIDTH = 340;
+
+// Mirrors BoxList.jsx's renderTree ordering, flattened to a plain id list so
+// arrow-key navigation visually matches what's shown in the box list.
+function flattenBoxOrder(boxes, parentId = null) {
+  const children = boxes
+    .filter((b) => (b.parent_box_id ?? null) === parentId)
+    .sort((a, b) => {
+      if (a.reading_order == null && b.reading_order == null) return a.id - b.id;
+      if (a.reading_order == null) return 1;
+      if (b.reading_order == null) return -1;
+      return a.reading_order - b.reading_order;
+    });
+  return children.flatMap((box) => [box.id, ...flattenBoxOrder(boxes, box.id)]);
+}
 
 const S = {
   root: { display: 'flex', flexDirection: 'column', height: '100vh', overflow: 'hidden' },
@@ -163,17 +178,6 @@ export default function AnnotatePage() {
       setPageTitle(pageName);
     }
   }
-
-  useEffect(() => {
-    function onKey(e) {
-      if (['INPUT', 'TEXTAREA', 'SELECT'].includes(document.activeElement?.tagName)) return;
-      const ctrl = e.ctrlKey || e.metaKey;
-      if (ctrl && e.key === 'z' && !e.shiftKey) { e.preventDefault(); handleUndo(); }
-      if (ctrl && (e.key === 'y' || (e.key === 'z' && e.shiftKey))) { e.preventDefault(); handleRedo(); }
-    }
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
-  }, [handleUndo, handleRedo]);
 
   const handleBoxCreated = useCallback((coords) => {
     if (lockedRef.current) return;
@@ -335,6 +339,37 @@ export default function AnnotatePage() {
       }
     } catch (e) { console.error('Failed to update box geometry', e); }
   }, [pageName, boxes]);
+
+  useEffect(() => {
+    function onKey(e) {
+      if (['INPUT', 'TEXTAREA', 'SELECT'].includes(document.activeElement?.tagName)) return;
+      const ctrl = e.ctrlKey || e.metaKey;
+      if (ctrl && e.key === 'z' && !e.shiftKey) { e.preventDefault(); handleUndo(); }
+      if (ctrl && (e.key === 'y' || (e.key === 'z' && e.shiftKey))) { e.preventDefault(); handleRedo(); }
+      if (ctrl) return;
+
+      // C1: number keys pick a tag type while the tag-picker is open
+      if (tagPickingFor && e.key >= '1' && e.key <= '9') {
+        const tag = HOTKEY_TAGS[Number(e.key) - 1];
+        if (tag) { e.preventDefault(); handleTagPicked(tag); }
+        return;
+      }
+
+      // C1: arrow keys move the selection between regions, in reading order
+      if (!tagPickingFor && (e.key === 'ArrowDown' || e.key === 'ArrowUp')) {
+        const order = flattenBoxOrder(boxes);
+        if (order.length === 0) return;
+        e.preventDefault();
+        const curIdx = order.indexOf(selectedBoxId);
+        const nextIdx = e.key === 'ArrowDown'
+          ? (curIdx < 0 ? 0 : Math.min(curIdx + 1, order.length - 1))
+          : (curIdx < 0 ? order.length - 1 : Math.max(curIdx - 1, 0));
+        handleBoxSelect(order[nextIdx]);
+      }
+    }
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [handleUndo, handleRedo, tagPickingFor, boxes, selectedBoxId, handleBoxSelect]);
 
   function handleTagPicked(tagType) {
     const id = tagPickingFor;
