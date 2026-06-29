@@ -56,13 +56,10 @@ def get_current_user(token: str = Depends(oauth2_scheme)) -> dict:
     except JWTError:
         raise exc
 
-    from database import get_conn
-    conn = get_conn()
-    cur  = conn.cursor()
-    cur.execute("SELECT role FROM users WHERE username = %s", (username,))
-    row = cur.fetchone()
-    cur.close()
-    conn.close()
+    from database import db_cursor
+    with db_cursor() as cur:
+        cur.execute("SELECT role FROM users WHERE username = %s", (username,))
+        row = cur.fetchone()
     if not row:
         raise exc
 
