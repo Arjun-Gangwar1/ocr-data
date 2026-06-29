@@ -1,4 +1,6 @@
 import os
+from contextlib import contextmanager
+
 import psycopg2
 import psycopg2.extras
 from dotenv import load_dotenv
@@ -15,6 +17,25 @@ def get_conn():
         password=os.getenv("DB_PASSWORD"),
         cursor_factory=psycopg2.extras.RealDictCursor,
     )
+
+
+@contextmanager
+def db_cursor():
+    """Yields a cursor; guarantees the connection is committed-and-closed on a
+    clean exit, or rolled-back-and-closed if anything raises (including a
+    `raise` inside the `with` block) — so a mid-request DB blip or bug can
+    never leak a connection out of the pool's reach."""
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        yield cur
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+        conn.close()
 
 
 def init_db():
