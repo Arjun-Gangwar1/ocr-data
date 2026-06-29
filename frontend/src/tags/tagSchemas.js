@@ -516,3 +516,10 @@ export const TAG_GROUPS = {
 export function getTagColour(tagType) {
   return TAG_SCHEMAS[tagType]?.colour || '#111111';
 }
+
+// Number-key shortcuts (1-9) for the most frequently used tags while picking a
+// type for a freshly drawn region — TEXT group plus the top of CORRECTIONS.
+export const HOTKEY_TAGS = [
+  'text', 'line', 'heading', 'paragraph',
+  'sout', 'scribble', 'overwrite', 'insert', 'underline',
+];
