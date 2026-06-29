@@ -2,6 +2,7 @@ import { useState, useEffect, useMemo } from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
   getManagerPages, approveManagerPage, sendBackPage, flagAdminPage,
+  getAdjudicationQueue, listAnnotators, assignAdjudicator,
   IMAGE_BASE_URL as IMAGE_BASE,
 } from '../api/client.js';
 import { useAuth } from '../context/AuthContext.jsx';
@@ -19,6 +20,7 @@ const AREA_STYLE = {
 
 const TABS = [
   { key: 'approve_annotations', label: 'Approve Annotations' },
+  { key: 'adjudication',        label: 'Adjudication' },
   { key: 'pending_approval',    label: 'Review queue' },
   { key: 'needs_rework',        label: 'Sent back' },
   { key: 'flagged_admin',       label: 'Flagged for admin' },
@@ -39,15 +41,40 @@ export default function ManagerPage() {
   const [modal,     setModal]     = useState(null);
   const [modalNote, setModalNote] = useState('');
 
+  const [adjQueue,      setAdjQueue]      = useState([]);
+  const [annotators,    setAnnotators]    = useState([]);
+  const [picked,        setPicked]        = useState({});
+  const [assigning,     setAssigning]     = useState(null);
+
   useEffect(() => { load(); }, []);
 
   async function load() {
     try {
-      setPages(await getManagerPages());
+      const [mgrPages, adj, annos] = await Promise.all([
+        getManagerPages(), getAdjudicationQueue(), listAnnotators(),
+      ]);
+      setPages(mgrPages);
+      setAdjQueue(adj);
+      setAnnotators(annos);
     } catch (e) {
       console.error(e);
     } finally {
       setLoading(false);
+    }
+  }
+
+  async function handleAssignAdjudicator(pageName) {
+    const adjudicator = picked[pageName];
+    if (!adjudicator) return;
+    setAssigning(pageName);
+    try {
+      await assignAdjudicator(pageName, adjudicator);
+      setAdjQueue(prev => prev.map(p => p.page_name === pageName
+        ? { ...p, adjudicator, adjudicator_status: 'assigned' } : p));
+    } catch (e) {
+      alert(e.response?.data?.detail || 'Failed to assign adjudicator.');
+    } finally {
+      setAssigning(null);
     }
   }
 
@@ -243,6 +270,8 @@ export default function ManagerPage() {
           {TABS.map(t => {
             const count = t.key === 'approve_annotations'
               ? pages.filter(p => p.area === 'pending_approval').length
+              : t.key === 'adjudication'
+              ? adjQueue.length
               : pages.filter(p => p.area === t.key).length;
             return (
               <button key={t.key} onClick={() => setTab(t.key)}
@@ -318,8 +347,66 @@ export default function ManagerPage() {
           </div>
         )}
 
+        {/* ── Adjudication queue ── */}
+        {tab === 'adjudication' && (
+          <div style={S.card}>
+            {loading ? <p style={S.muted}>Loading…</p> : adjQueue.length === 0 ? (
+              <p style={S.muted}>No pages awaiting adjudication.</p>
+            ) : (
+              <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '13px' }}>
+                <thead>
+                  <tr style={{ borderBottom: '1px solid #eee' }}>
+                    {['Page', 'Subject', 'IAA', 'Adjudicator', ''].map(h => (
+                      <th key={h} style={S.th}>{h}</th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {adjQueue.map(p => (
+                    <tr key={p.page_name} style={{ borderBottom: '1px solid #f5f5f5' }}>
+                      <td style={{ ...S.td, fontWeight: 600, maxWidth: '180px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
+                        title={p.page_name}>{p.page_name}</td>
+                      <td style={S.td}>
+                        <span style={S.tag}>{CLASS_LABEL[p.cls] || p.cls}</span>
+                        <span style={S.tag}>{SUBJECT_LABEL[p.subject] || p.subject}</span>
+                      </td>
+                      <td style={S.td}>{p.iaa != null ? `${Math.round(p.iaa * 100)}%` : '—'}</td>
+                      <td style={S.td}>
+                        {p.adjudicator
+                          ? <span style={{ color: '#6a1b9a', fontWeight: 600 }}>{p.adjudicator}</span>
+                          : <span style={{ color: '#aaa' }}>Unassigned</span>}
+                      </td>
+                      <td style={{ ...S.td, textAlign: 'right', whiteSpace: 'nowrap' }}>
+                        {!p.adjudicator && (
+                          <>
+                            <select
+                              value={picked[p.page_name] || ''}
+                              onChange={e => setPicked(prev => ({ ...prev, [p.page_name]: e.target.value }))}
+                              style={S.adjSelect}
+                            >
+                              <option value="">Pick annotator…</option>
+                              {annotators.map(a => <option key={a} value={a}>{a}</option>)}
+                            </select>
+                            <button
+                              onClick={() => handleAssignAdjudicator(p.page_name)}
+                              disabled={!picked[p.page_name] || assigning === p.page_name}
+                              style={{ ...S.approveBtn, marginLeft: '5px' }}
+                            >
+                              {assigning === p.page_name ? '…' : 'Assign'}
+                            </button>
+                          </>
+                        )}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+          </div>
+        )}
+
         {/* ── Table view ── */}
-        {tab !== 'approve_annotations' && (
+        {tab !== 'approve_annotations' && tab !== 'adjudication' && (
           <div style={S.card}>
             {loading ? (
               <p style={S.muted}>Loading…</p>
@@ -466,6 +553,7 @@ const S = {
   tag:             { fontSize: '11px', backgroundColor: '#f0f0f0', color: '#555', padding: '2px 7px', borderRadius: '8px', marginRight: '3px', display: 'inline-block', whiteSpace: 'nowrap' },
   annotateBtn:     { padding: '4px 10px', backgroundColor: '#e8eaf6', color: '#3949ab', border: '1px solid #c5cae9', borderRadius: '5px', cursor: 'pointer', fontSize: '12px', fontWeight: 600 },
   approveBtn:      { padding: '4px 10px', background: 'none', border: '1px solid #a5d6a7', color: '#2e7d32', borderRadius: '5px', cursor: 'pointer', fontSize: '12px' },
+  adjSelect:       { padding: '4px 6px', fontSize: '12px', border: '1px solid #ddd', borderRadius: '5px', color: '#444' },
   sendBackBtn:     { padding: '4px 10px', background: 'none', border: '1px solid #ffcc80', color: '#e65100', borderRadius: '5px', cursor: 'pointer', fontSize: '12px' },
   flagBtn:         { padding: '4px 10px', background: 'none', border: '1px solid #f48fb1', color: '#b71c1c', borderRadius: '5px', cursor: 'pointer', fontSize: '12px' },
   sendBackConfirm: { padding: '6px 16px', backgroundColor: '#ff9800', color: '#fff', border: 'none', borderRadius: '5px', cursor: 'pointer', fontSize: '13px', fontWeight: 600 },
