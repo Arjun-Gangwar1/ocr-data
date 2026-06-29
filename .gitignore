@@ -4,6 +4,7 @@ __pycache__/
 *.pyo
 backend/*.db
 backend/uploads/
+backend/venv/
 
 # Node
 frontend/node_modules/
