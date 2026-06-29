@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { getMyPages, getAnnotationRequests, createAnnotationRequest, submitPage } from '../api/client.js';
+import { getMyAssignments, getAnnotationRequests, createAnnotationRequest, submitPage } from '../api/client.js';
 import { useAuth } from '../context/AuthContext.jsx';
 
 const MEDIUMS  = [{ val: 'english_medium', label: 'English Medium' }, { val: 'kannada_medium', label: 'Kannada Medium' }];
@@ -42,7 +42,7 @@ export default function AnnotatorPage() {
 
   async function load() {
     try {
-      const [pg, rq] = await Promise.all([getMyPages(), getAnnotationRequests()]);
+      const [pg, rq] = await Promise.all([getMyAssignments(), getAnnotationRequests()]);
       setPages(pg);
       setRequests(rq);
     } catch (e) {
@@ -77,10 +77,12 @@ export default function AnnotatorPage() {
     }
   }
 
-  const rework      = pages.filter(p => p.area === 'needs_rework');
-  const inProgress  = pages.filter(p => p.area === 'assigned');
-  const pendingAppr = pages.filter(p => p.area === 'pending_approval');
-  const approved    = pages.filter(p => p.area === 'approved');
+  const rework        = pages.filter(p => p.area === 'needs_rework');
+  const inProgress    = pages.filter(p => p.area === 'assigned');
+  const adjudicating  = pages.filter(p => p.area === 'needs_adjudication' && p.tier === 3);
+  const awaitingAdj   = pages.filter(p => p.area === 'needs_adjudication' && p.tier !== 3);
+  const pendingAppr   = pages.filter(p => p.area === 'pending_approval');
+  const approved      = pages.filter(p => p.area === 'approved');
 
   return (
     <div style={{ minHeight: '100vh', backgroundColor: '#f5f6f8' }}>
@@ -127,6 +129,34 @@ export default function AnnotatorPage() {
             </div>
           )}
         </div>
+
+        {/* Adjudication — assigned to me as tier-3 */}
+        {adjudicating.length > 0 && (
+          <div style={{ ...S.card, borderColor: '#ce93d8' }}>
+            <div style={S.cardTitle}>
+              Needs your adjudication
+              <span style={{ ...S.count, backgroundColor: '#f3e5f5', color: '#6a1b9a' }}>{adjudicating.length}</span>
+            </div>
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(260px, 1fr))', gap: '10px' }}>
+              {adjudicating.map(p => (
+                <PageCard key={p.page_name} page={p} navigate={navigate} onSubmit={handleSubmit} adjudicate />
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* Awaiting someone else's adjudication */}
+        {awaitingAdj.length > 0 && (
+          <div style={S.card}>
+            <div style={S.cardTitle}>
+              Awaiting adjudication
+              <span style={S.count}>{awaitingAdj.length}</span>
+            </div>
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(260px, 1fr))', gap: '10px' }}>
+              {awaitingAdj.map(p => <PageCard key={p.page_name} page={p} navigate={navigate} />)}
+            </div>
+          </div>
+        )}
 
         {/* Pending approval */}
         {pendingAppr.length > 0 && (
@@ -248,16 +278,18 @@ export default function AnnotatorPage() {
   );
 }
 
-function PageCard({ page, navigate, onSubmit, showRemark, pendingApproval }) {
+function PageCard({ page, navigate, onSubmit, showRemark, pendingApproval, adjudicate }) {
   const [hover, setHover] = useState(false);
   const name     = page.page_name;
   const boxCount = page.box_count ?? 0;
   const area     = page.area;
 
-  const canSubmit = onSubmit && (area === 'assigned' || area === 'needs_rework' || pendingApproval);
+  const canSubmit = onSubmit && (area === 'assigned' || area === 'needs_rework' || pendingApproval || adjudicate);
 
   const statusBadge = area === 'approved'
     ? { label: 'Approved', bg: '#e8f5e9', color: '#1b5e20' }
+    : area === 'needs_adjudication' && !adjudicate
+    ? { label: 'With adjudicator', bg: '#f3e5f5', color: '#6a1b9a' }
     : null;
 
   return (
@@ -297,6 +329,12 @@ function PageCard({ page, navigate, onSubmit, showRemark, pendingApproval }) {
             </span>
           ) : (
             <>
+              {adjudicate && (
+                <button
+                  onClick={() => navigate(`/adjudicate/${encodeURIComponent(name)}`)}
+                  style={S.adjudicateBtn}
+                >Compare</button>
+              )}
               <button
                 onClick={() => navigate(`/annotate/${encodeURIComponent(name)}`)}
                 style={S.annotateBtn}
@@ -358,6 +396,10 @@ const S = {
   annotateBtn: {
     padding: '4px 12px', backgroundColor: '#3f51b5', color: '#fff',
     border: 'none', borderRadius: '5px', cursor: 'pointer', fontSize: '12px', fontWeight: 600,
+  },
+  adjudicateBtn: {
+    padding: '4px 12px', backgroundColor: '#fff', color: '#6a1b9a',
+    border: '1px solid #ce93d8', borderRadius: '5px', cursor: 'pointer', fontSize: '12px', fontWeight: 600,
   },
   submitPageBtn: {
     padding: '4px 12px', backgroundColor: '#fff', color: '#2e7d32',
