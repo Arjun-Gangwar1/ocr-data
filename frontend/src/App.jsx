@@ -8,6 +8,7 @@ import ScannerPage from './pages/ScannerPage.jsx';
 import AdminPage from './pages/AdminPage.jsx';
 import PictakerPage from './pages/PictakerPage.jsx';
 import AnnotatorPage from './pages/AnnotatorPage.jsx';
+import AdjudicationPage from './pages/AdjudicationPage.jsx';
 import ManagerPage from './pages/ManagerPage.jsx';
 import MaskerPage from './pages/MaskerPage.jsx';
 import { useAuth } from './context/AuthContext.jsx';
@@ -33,6 +34,7 @@ export default function App() {
           <Route path="/admin" element={<ProtectedRoute roles={['admin']}><AdminPage /></ProtectedRoute>} />
           <Route path="/pictaker" element={<ProtectedRoute roles={['pictaker']}><PictakerPage /></ProtectedRoute>} />
           <Route path="/annotator" element={<ProtectedRoute roles={['annotator']}><AnnotatorPage /></ProtectedRoute>} />
+          <Route path="/adjudicate/:pageName" element={<ProtectedRoute roles={['annotator', 'manager', 'admin']}><AdjudicationPage /></ProtectedRoute>} />
           <Route path="/manager"  element={<ProtectedRoute roles={['manager', 'admin']}><ManagerPage /></ProtectedRoute>} />
           <Route path="/masker"   element={<ProtectedRoute roles={['masker', 'admin']}><MaskerPage /></ProtectedRoute>} />
           <Route path="*" element={<Navigate to="/" replace />} />
