@@ -23,7 +23,6 @@ API.interceptors.response.use(
 );
 
 export const IMAGE_BASE_URL = `${BACKEND}/uploads`;
-export const RAW_BASE_URL   = `${BACKEND}/raw`;
 
 function _isRect(pts) {
   if (pts.length !== 4) return false;
@@ -242,6 +241,11 @@ export async function getMyPages() {
   return data;
 }
 
+export async function getMyAssignments() {
+  const { data } = await API.get('/my-assignments');
+  return data;
+}
+
 export async function getAnnotationRequests() {
   const { data } = await API.get('/annotation-requests');
   return data;
@@ -274,6 +278,26 @@ export async function withdrawPage(pageName) {
 
 export async function getManagerPages() {
   const { data } = await API.get('/manager/pages');
+  return data;
+}
+
+export async function getAdjudicationQueue() {
+  const { data } = await API.get('/adjudication');
+  return data;
+}
+
+export async function listAnnotators() {
+  const { data } = await API.get('/annotators');
+  return data;
+}
+
+export async function assignAdjudicator(pageName, adjudicator) {
+  const { data } = await API.post(`/pages/${encodeURIComponent(pageName)}/assign-adjudicator`, { adjudicator });
+  return data;
+}
+
+export async function getAdjudicationView(pageName) {
+  const { data } = await API.get(`/pages/${encodeURIComponent(pageName)}/adjudication-view`);
   return data;
 }
 
@@ -334,5 +358,25 @@ export async function getAnnotatorAnalytics() {
 
 export async function getAnalyticsSummary() {
   const { data } = await API.get('/admin/analytics/summary');
+  return data;
+}
+
+export async function getGoldScores() {
+  const { data } = await API.get('/admin/gold-scores');
+  return data;
+}
+
+export async function setGold(pageName, payload) {
+  const { data } = await API.post(`/admin/pages/${encodeURIComponent(pageName)}/gold`, payload);
+  return data;
+}
+
+export async function getAdminPages() {
+  const { data } = await API.get('/admin/pages');
+  return data;
+}
+
+export async function bulkAssignPages(pageNames, annotator) {
+  const { data } = await API.post('/admin/pages/bulk-assign', { page_names: pageNames, annotator });
   return data;
 }
