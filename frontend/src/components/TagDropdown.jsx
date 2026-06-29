@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { TAG_GROUPS, TAG_SCHEMAS } from '../tags/tagSchemas.js';
+import { TAG_GROUPS, TAG_SCHEMAS, HOTKEY_TAGS } from '../tags/tagSchemas.js';
 
 const PAGE_GROUPS = ['PAGE'];
 
@@ -20,6 +20,10 @@ const styles = {
     display: 'inline-flex', alignItems: 'center', gap: '6px',
   },
   swatch: { width: '8px', height: '8px', borderRadius: '2px', display: 'inline-block', flexShrink: 0 },
+  hotkey: {
+    fontSize: '9px', fontWeight: 700, color: '#999', border: '1px solid #ccc',
+    borderRadius: '3px', padding: '0 4px', marginLeft: '2px', lineHeight: '13px',
+  },
   divider: { borderTop: '1px solid #e8e8e8', margin: '10px 0 8px' },
   cancelBtn: {
     marginTop: '8px', padding: '4px 10px', fontSize: '12px',
@@ -38,6 +42,8 @@ export default function TagDropdown({ onPick, onCancel }) {
     const schema = TAG_SCHEMAS[tag];
     if (!schema) return null;
     const isHov = hovered === tag;
+    const hotkeyIdx = HOTKEY_TAGS.indexOf(tag);
+    const hotkey = hotkeyIdx >= 0 ? hotkeyIdx + 1 : null;
     if (prominent) {
       return (
         <button
@@ -54,6 +60,7 @@ export default function TagDropdown({ onPick, onCancel }) {
         >
           <span style={{ ...styles.swatch, width: '10px', height: '10px', backgroundColor: schema.colour }} />
           {schema.label}
+          {hotkey && <span style={styles.hotkey}>{hotkey}</span>}
         </button>
       );
     }
@@ -71,6 +78,7 @@ export default function TagDropdown({ onPick, onCancel }) {
       >
         <span style={{ ...styles.swatch, backgroundColor: schema.colour }} />
         {schema.label}
+        {hotkey && <span style={styles.hotkey}>{hotkey}</span>}
       </button>
     );
   }
