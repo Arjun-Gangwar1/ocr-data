@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { getMyUploads, deletePage, IMAGE_BASE_URL, RAW_BASE_URL } from '../api/client.js';
+import { getMyUploads, deletePage, IMAGE_BASE_URL } from '../api/client.js';
 import { useAuth } from '../context/AuthContext.jsx';
 
 const SUBJECT_LABELS = {
@@ -70,9 +70,9 @@ export default function PictakerPage() {
   }
 
   function handleRecrop(p) {
-    const recropUrl = p.raw_image_path
-      ? `${RAW_BASE_URL}/${p.raw_image_path}`
-      : `${IMAGE_BASE_URL}/${p.image_path}`;
+    // Not actually fetched as a URL — ScannerPage re-fetches the raw image itself via
+    // the authed getRawImage(recropPageName); this only signals "recrop, not retake".
+    const recropUrl = p.raw_image_path ? true : `${IMAGE_BASE_URL}/${p.image_path}`;
     let recropCorners = null;
     if (p.crop_corners) {
       try { recropCorners = JSON.parse(p.crop_corners); } catch {}
